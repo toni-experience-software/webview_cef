@@ -151,17 +151,18 @@ namespace webview_cef {
         if (!bridge_tex_ || !shared_handle_) {
             return nullptr;
         }
-        auto* holder = new DescriptorHolder();
-        holder->texture = bridge_tex_;  // keep alive until Flutter opens the handle
-        holder->descriptor.struct_size = sizeof(FlutterDesktopGpuSurfaceDescriptor);
-        holder->descriptor.handle = shared_handle_;
-        holder->descriptor.width = holder->descriptor.visible_width = tex_width_;
-        holder->descriptor.height = holder->descriptor.visible_height = tex_height_;
-        holder->descriptor.format = flutter_format_;
-        holder->descriptor.release_callback = [](void* release_context) {
-            delete static_cast<DescriptorHolder*>(release_context);
-        };
-        holder->descriptor.release_context = holder;
-        return &holder->descriptor;
+        // The descriptor must outlive this call: the engine reads
+        // visible_width/height AFTER invoking release_callback (see
+        // ExternalTextureD3d::PopulateTexture), so hand out a long-lived member
+        // with no release callback and pin the texture via |descriptor_tex_|.
+        descriptor_tex_ = bridge_tex_;
+        descriptor_.struct_size = sizeof(FlutterDesktopGpuSurfaceDescriptor);
+        descriptor_.handle = shared_handle_;
+        descriptor_.width = descriptor_.visible_width = tex_width_;
+        descriptor_.height = descriptor_.visible_height = tex_height_;
+        descriptor_.format = flutter_format_;
+        descriptor_.release_callback = nullptr;
+        descriptor_.release_context = nullptr;
+        return &descriptor_;
     }
 }  // namespace webview_cef
