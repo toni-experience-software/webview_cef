@@ -40,6 +40,65 @@ namespace webview_cef {
 	// cheap to rebuild, so they're dropped; the HTTP cache (map tiles) is kept.
 	static constexpr wchar_t kCleanExitMarker[] = L".clean_exit";
 
+	// Exclusive-ownership token for the profile dir, held for the whole process
+	// lifetime (see acquireProfileLock).
+	static constexpr wchar_t kProfileLockFile[] = L".profile_lock";
+	static HANDLE g_profileLock = INVALID_HANDLE_VALUE;
+
+	// Claims sole ownership of the profile dir, or fails if another instance
+	// already owns it.
+	//
+	// The clean-exit marker is absent for as long as an instance is running, so a
+	// second launch would read "the previous run died", drop the caches — and
+	// they belong to the *live* first instance. CefInitialize's own profile
+	// singleton only rejects the second instance much later, after the deletion.
+	// The profile path is keyed per executable name, so two launches of the same
+	// app always target the same profile; this is the common case, not a corner.
+	//
+	// CreateFileW with dwShareMode 0 is the kernel's own mutual exclusion: the
+	// open either succeeds for exactly one process or fails with a sharing
+	// violation, with no window in between, and the handle is reclaimed by the OS
+	// even if the process is killed — so a crash never leaves the profile locked.
+	// OPEN_ALWAYS (not CREATE_ALWAYS) because the file is a handle to hold, not
+	// content to write: nothing needs truncating, and CREATE_ALWAYS additionally
+	// fails on attribute mismatches.
+	static bool acquireProfileLock(const std::wstring& cacheDir)
+	{
+		if (g_profileLock != INVALID_HANDLE_VALUE) {
+			return true;
+		}
+		const std::wstring lockPath = cacheDir + L"\\" + kProfileLockFile;
+		g_profileLock = CreateFileW(lockPath.c_str(), GENERIC_WRITE,
+		                            0 /* dwShareMode: no sharing */, nullptr,
+		                            OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+		return g_profileLock != INVALID_HANDLE_VALUE;
+	}
+
+	static void releaseProfileLock()
+	{
+		if (g_profileLock != INVALID_HANDLE_VALUE) {
+			CloseHandle(g_profileLock);
+			g_profileLock = INVALID_HANDLE_VALUE;
+		}
+	}
+
+	// Whether the profile holds anything from an earlier run. The lock file is
+	// ours and is created before this runs, so it must not count as contents —
+	// otherwise a first-ever launch looks like a previous run that never marked
+	// itself clean.
+	static bool profileHasContents(const std::wstring& cacheDir)
+	{
+		namespace fs = std::filesystem;
+		std::error_code ec;
+		for (fs::directory_iterator it(cacheDir, ec), end;
+		     !ec && it != end; it.increment(ec)) {
+			if (it->path().filename().wstring() != kProfileLockFile) {
+				return true;
+			}
+		}
+		return false;
+	}
+
 	static void dropVolatileCachesAfterUncleanExit(const std::wstring& cacheDir)
 	{
 		namespace fs = std::filesystem;
@@ -842,23 +901,31 @@ namespace webview_cef {
 			std::error_code ec;
 			fs::create_directories(cachePath, ec);
 			if (!ec) {
-				// Unclean-exit recovery: no clean-exit marker on a non-empty
-				// profile → the previous run was killed hard; drop the
-				// volatile caches before CEF touches them.
-				const fs::path marker = fs::path(cachePath) / kCleanExitMarker;
-				std::error_code mec;
-				const bool cleanExit = fs::exists(marker, mec);
-				const bool hasContents =
-				    fs::directory_iterator(cachePath, mec) !=
-				    fs::directory_iterator();
-				if (hasContents && !cleanExit) {
-					dropVolatileCachesAfterUncleanExit(cachePath);
+				// Own the profile before reading anything in it: the marker
+				// only means "the previous run died" to the instance that
+				// actually owns the profile (see acquireProfileLock). A second,
+				// concurrent instance skips recovery entirely and lets
+				// CefInitialize report the singleton failure below — deleting
+				// caches out from under a running instance is far worse than a
+				// second instance that refuses to start.
+				if (acquireProfileLock(cachePath)) {
+					// Unclean-exit recovery: no clean-exit marker on a
+					// non-empty profile → the previous run was killed hard;
+					// drop the volatile caches before CEF touches them.
+					const fs::path marker = fs::path(cachePath) / kCleanExitMarker;
+					std::error_code mec;
+					const bool cleanExit = fs::exists(marker, mec);
+					if (profileHasContents(cachePath) && !cleanExit) {
+						dropVolatileCachesAfterUncleanExit(cachePath);
+					}
+					// This run is dirty until stopCEF() completes.
+					fs::remove(marker, mec);
+					// Also gates writing the marker in stopCEF(): a
+					// non-owner must never mark someone else's profile clean.
+					g_cacheDir = cachePath;
 				}
-				// This run is dirty until stopCEF() completes.
-				fs::remove(marker, mec);
 
 				CefString(&cefs.cache_path).FromWString(cachePath);
-				g_cacheDir = cachePath;
 				// Keeps the GPU shader disk cache enabled (see
 				// WebviewApp::OnBeforeCommandLineProcessing).
 				if (app) {
@@ -930,6 +997,11 @@ namespace webview_cef {
     {
 		// CefShutdown without a successful CefInitialize crashes.
 		if (!g_cefInitOk) {
+#ifdef _WIN32
+			// Nothing to shut down, but a lock taken by a failed start must not
+			// outlive it — CEF is not running, so the profile is free.
+			releaseProfileLock();
+#endif
 			return;
 		}
 		// Browser closes are async (the plugin dtor's CloseAllBrowsers posts to
@@ -955,6 +1027,9 @@ namespace webview_cef {
 			std::ofstream(std::filesystem::path(g_cacheDir) / kCleanExitMarker)
 			    << '1';
 		}
+		// Last: the next instance may start the moment the profile is free, and
+		// it must see the marker written above.
+		releaseProfileLock();
 #endif
     }
 }
