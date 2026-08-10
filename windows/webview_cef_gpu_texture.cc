@@ -119,8 +119,12 @@ namespace webview_cef {
         }
         std::lock_guard<std::mutex> lock(mutex_);
 
-        // CEF's shared texture is pool-owned and only valid during this call, so
-        // reopen it on our device every frame (NT handle -> OpenSharedResource1).
+        // CEF's shared texture is pool-owned and only valid during this call,
+        // so reopen it on our device every frame (NT handle ->
+        // OpenSharedResource1). Do NOT cache by handle value: CEF hands out a
+        // fresh handle per callback and the OS recycles closed handle values,
+        // so a cache can silently resolve to a stale pool texture — copying
+        // old frames and making motion visibly snap back and forth.
         ComPtr<ID3D11Texture2D> cef_tex;
         HRESULT hr = device_->OpenSharedResource1(
             reinterpret_cast<HANDLE>(const_cast<void*>(sharedHandle)), IID_PPV_ARGS(&cef_tex));
