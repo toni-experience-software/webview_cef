@@ -5,16 +5,73 @@
 #endif
 
 #include <math.h>
+#include <chrono>
 #include <memory>
 #include <thread>
 #include <iostream>
 #include <unordered_map>
+
+#ifdef _WIN32
+#include <windows.h>
+#include <filesystem>
+#include <fstream>
+#include <set>
+#include <vector>
+#endif
 
 namespace webview_cef {
 	CefMainArgs mainArgs;
 	CefRefPtr<WebviewApp> app;
 	CefString userAgent;
 	bool isCefInitialized = false;
+	// Whether CefInitialize actually succeeded this session — CefShutdown
+	// without a successful init crashes, so stopCEF() gates on it.
+	static bool g_cefInitOk = false;
+#ifdef _WIN32
+	// The persistent profile dir (empty when running cache-less). Used by the
+	// clean-exit marker below.
+	static std::wstring g_cacheDir;
+	// Present in the profile dir iff the previous run shut down cleanly. Removed
+	// at startup (this run is now "dirty"), written after CefShutdown completes.
+	// A missing marker on a non-empty profile means the last run was killed hard
+	// (dev stop button, vehicle power cut) — its GPU/shader/code caches may be
+	// half-written, and a corrupt entry there can crash-loop the GPU process on
+	// the NEXT boot (WebGL gone → the map renders nothing). Those caches are
+	// cheap to rebuild, so they're dropped; the HTTP cache (map tiles) is kept.
+	static constexpr wchar_t kCleanExitMarker[] = L".clean_exit";
+
+	static void dropVolatileCachesAfterUncleanExit(const std::wstring& cacheDir)
+	{
+		namespace fs = std::filesystem;
+		static const std::set<std::wstring> kVolatile = {
+			L"GPUCache", L"ShaderCache", L"GrShaderCache",
+			L"GraphiteDawnCache", L"DawnCache", L"DawnWebGPUCache",
+			L"Code Cache",
+		};
+		std::vector<fs::path> doomed;
+		std::error_code ec;
+		for (fs::recursive_directory_iterator it(cacheDir, ec), end;
+		     !ec && it != end; it.increment(ec)) {
+			if (it->is_directory(ec) &&
+			    kVolatile.count(it->path().filename().wstring()) != 0) {
+				doomed.push_back(it->path());
+				it.disable_recursion_pending();
+			}
+		}
+		for (const auto& dir : doomed) {
+			std::error_code rmec;
+			fs::remove_all(dir, rmec);
+		}
+		if (!doomed.empty()) {
+			fprintf(stderr,
+			        "[webview_cef] previous run exited uncleanly; dropped %zu "
+			        "GPU/shader/code cache dir(s) to avoid a poisoned GPU "
+			        "process.\n",
+			        doomed.size());
+			fflush(stderr);
+		}
+	}
+#endif
 #ifdef OS_MAC
 	std::string g_macSubprocessPath;
 	std::string g_macFrameworkDirPath;
@@ -729,11 +786,83 @@ namespace webview_cef {
 		return CefExecuteProcess(mainArgs, app, nullptr);
 	}
 
+#ifdef _WIN32
+	// Default persistent profile location: %LOCALAPPDATA%\<exe name>\webview_cef.
+	// Keyed per executable so different embedder apps never share a profile
+	// (CEF locks root_cache_path to a single running browser-process instance).
+	// Returns empty if the location can't be resolved.
+	static std::wstring defaultCachePath()
+	{
+		wchar_t exePath[MAX_PATH];
+		const DWORD len = GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+		if (len == 0 || len >= MAX_PATH) {
+			return L"";
+		}
+		std::wstring name(exePath, len);
+		const size_t slash = name.find_last_of(L"\\/");
+		if (slash != std::wstring::npos) {
+			name = name.substr(slash + 1);
+		}
+		const size_t dot = name.find_last_of(L'.');
+		if (dot != std::wstring::npos) {
+			name = name.substr(0, dot);
+		}
+		wchar_t* localAppData = nullptr;
+		size_t envLen = 0;
+		if (_wdupenv_s(&localAppData, &envLen, L"LOCALAPPDATA") != 0 || localAppData == nullptr) {
+			return L"";
+		}
+		std::wstring base(localAppData);
+		free(localAppData);
+		if (base.empty() || name.empty()) {
+			return L"";
+		}
+		return base + L"\\" + name + L"\\webview_cef";
+	}
+#endif
+
 	void startCEF()
 	{
 		CefSettings cefs;
 		cefs.windowless_rendering_enabled = true;
 		cefs.no_sandbox = true;
+#ifdef _WIN32
+		// Persistent browser profile. Without cache_path CEF runs a fully
+		// in-memory ("incognito") profile: no HTTP cache (map tiles, glyphs,
+		// sprites re-download every launch) and nowhere to keep the GPU shader
+		// disk cache, so WebGL-heavy pages recompile every shader on each boot.
+		// root_cache_path is left empty and defaults to cache_path.
+		const std::wstring cachePath = defaultCachePath();
+		if (!cachePath.empty()) {
+			namespace fs = std::filesystem;
+			std::error_code ec;
+			fs::create_directories(cachePath, ec);
+			if (!ec) {
+				// Unclean-exit recovery: no clean-exit marker on a non-empty
+				// profile → the previous run was killed hard; drop the
+				// volatile caches before CEF touches them.
+				const fs::path marker = fs::path(cachePath) / kCleanExitMarker;
+				std::error_code mec;
+				const bool cleanExit = fs::exists(marker, mec);
+				const bool hasContents =
+				    fs::directory_iterator(cachePath, mec) !=
+				    fs::directory_iterator();
+				if (hasContents && !cleanExit) {
+					dropVolatileCachesAfterUncleanExit(cachePath);
+				}
+				// This run is dirty until stopCEF() completes.
+				fs::remove(marker, mec);
+
+				CefString(&cefs.cache_path).FromWString(cachePath);
+				g_cacheDir = cachePath;
+				// Keeps the GPU shader disk cache enabled (see
+				// WebviewApp::OnBeforeCommandLineProcessing).
+				if (app) {
+					app->SetHasPersistentCache(true);
+				}
+			}
+		}
+#endif
 		if(!userAgent.empty()){
 			CefString(&cefs.user_agent_product) = userAgent;
 		}
@@ -757,7 +886,20 @@ namespace webview_cef {
 		//cef message run in another thread on windows/linux
 		cefs.multi_threaded_message_loop = true;
 #endif
-		CefInitialize(mainArgs, cefs, app.get(), nullptr);
+		g_cefInitOk = CefInitialize(mainArgs, cefs, app.get(), nullptr);
+		if (!g_cefInitOk) {
+			// Most likely cause with a persistent cache_path: another (possibly
+			// zombie) instance still holds the profile lock. Without this log the
+			// failure is invisible — browsers just never create and the map stays
+			// uncontrollable/blank.
+			fprintf(stderr,
+			        "[webview_cef] ERROR: CefInitialize failed (exit code %d). "
+			        "If a previous instance is still running (or died without "
+			        "releasing the profile lock), close it or delete the cache "
+			        "directory. Webviews will not work in this session.\n",
+			        CefGetExitCode());
+			fflush(stderr);
+		}
 	}
 
 	void doMessageLoopWork(){
@@ -782,6 +924,33 @@ namespace webview_cef {
 
     void stopCEF()
     {
+		// CefShutdown without a successful CefInitialize crashes.
+		if (!g_cefInitOk) {
+			return;
+		}
+		// Browser closes are async (the plugin dtor's CloseAllBrowsers posts to
+		// CEF's UI thread, which runs on its own thread here —
+		// multi_threaded_message_loop). CefShutdown while any browser is alive
+		// is undefined: it can hang the process invisibly after the window
+		// closed, and the zombie's half-written profile then breaks every
+		// subsequent launch. Wait (bounded) for the closes to land first.
+		for (int i = 0; i < 200 && WebviewHandler::liveBrowserCount() > 0; ++i) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(10));
+		}
+		if (WebviewHandler::liveBrowserCount() > 0) {
+			fprintf(stderr,
+			        "[webview_cef] WARNING: browsers still open after 2s; "
+			        "forcing CefShutdown anyway.\n");
+			fflush(stderr);
+		}
 		CefShutdown();
+		g_cefInitOk = false;
+#ifdef _WIN32
+		// Mark this run as cleanly shut down (see kCleanExitMarker).
+		if (!g_cacheDir.empty()) {
+			std::ofstream(std::filesystem::path(g_cacheDir) / kCleanExitMarker)
+			    << '1';
+		}
+#endif
     }
 }

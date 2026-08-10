@@ -64,6 +64,11 @@ public:
     
     explicit WebviewHandler();
     ~WebviewHandler();
+
+    // Browsers created and not yet fully closed, across all handlers. Browser
+    // closes are async (CloseBrowser posts to CEF's UI thread); CefShutdown
+    // while any are alive is undefined — shutdown waits on this reaching zero.
+    static int liveBrowserCount();
     
     // CefClient methods:
     virtual CefRefPtr<CefDisplayHandler> GetDisplayHandler() override {
