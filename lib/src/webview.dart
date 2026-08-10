@@ -396,26 +396,17 @@ class WebViewState extends State<WebView> with WebeViewTextInput {
     };
 
     _controller._onCursorChanged = (int type) {
-      switch (type) {
-        case 0:
-          _mouseType = SystemMouseCursors.basic;
-          break;
-        case 1:
-          _mouseType = SystemMouseCursors.precise;
-          break;
-        case 2:
-          _mouseType = SystemMouseCursors.click;
-          break;
-        case 3:
-          _mouseType = SystemMouseCursors.text;
-          break;
-        case 4:
-          _mouseType = SystemMouseCursors.wait;
-          break;
-        default:
-          _mouseType = SystemMouseCursors.basic;
-          break;
-      }
+      final cursor = switch (type) {
+        1 => SystemMouseCursors.precise,
+        2 => SystemMouseCursors.click,
+        3 => SystemMouseCursors.text,
+        4 => SystemMouseCursors.wait,
+        _ => SystemMouseCursors.basic,
+      };
+      // Hover-heavy pages fire cursor changes rapidly; don't rebuild the whole
+      // webview subtree unless the cursor actually changed.
+      if (cursor == _mouseType) return;
+      _mouseType = cursor;
       setState(() {});
     };
 
