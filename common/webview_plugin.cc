@@ -1,5 +1,9 @@
 #include "webview_plugin.h"
 
+// CefCurrentlyOn/TID_UI: shutdown has to know whether it is itself the CEF UI
+// thread (external message pump) or not (multi_threaded_message_loop).
+#include "include/cef_task.h"
+
 #ifdef OS_MAC
 #include <include/wrapper/cef_library_loader.h>
 #endif
@@ -1004,16 +1008,40 @@ namespace webview_cef {
 #endif
 			return;
 		}
-		// Browser closes are async (the plugin dtor's CloseAllBrowsers posts to
-		// CEF's UI thread, which runs on its own thread here —
-		// multi_threaded_message_loop). CefShutdown while any browser is alive
-		// is undefined: it can hang the process invisibly after the window
-		// closed, and the zombie's half-written profile then breaks every
-		// subsequent launch. Wait (bounded) for the closes to land first.
-		for (int i = 0; i < 200 && WebviewHandler::liveBrowserCount() > 0; ++i) {
+		// Ask the browsers to close before waiting for them. Only the plugin
+		// destructor used to do this, so the public quit() method channel
+		// reached the wait below with every browser still live: it always spent
+		// the full timeout and then force-shut-down in exactly the state the
+		// wait exists to prevent. Requesting the closes here covers every
+		// entry point into shutdown.
+		WebviewHandler::closeAllBrowsersForShutdown();
+		// Browser closes are async (CloseBrowser is issued on CEF's UI thread,
+		// and the browser is only gone once OnBeforeClose fires there).
+		// CefShutdown while any browser is alive is undefined: it can hang the
+		// process invisibly after the window closed, and the zombie's
+		// half-written profile then breaks every subsequent launch. Wait
+		// (bounded) for the closes to land first.
+		//
+		// This blocks the calling thread — the Flutter platform thread when it
+		// comes from quit(). That is acceptable *here* because this is teardown:
+		// nothing is left to render, and the alternative is an undefined
+		// CefShutdown that can block forever. With the closes actually requested
+		// above it now normally returns in a few milliseconds; the 2s ceiling is
+		// the pathological case, not the usual one.
+		bool allClosed = WebviewHandler::liveBrowserCount() == 0;
+		for (int i = 0; i < 200 && !allClosed; ++i) {
+			// Where CEF's UI thread *is* the calling thread (external message
+			// pump — macOS), no one else runs the closes while we block, so
+			// sleeping alone would guarantee the timeout. Under
+			// multi_threaded_message_loop (Windows/Linux) CEF drives its own UI
+			// thread and this is false.
+			if (CefCurrentlyOn(TID_UI)) {
+				CefDoMessageLoopWork();
+			}
 			std::this_thread::sleep_for(std::chrono::milliseconds(10));
+			allClosed = WebviewHandler::liveBrowserCount() == 0;
 		}
-		if (WebviewHandler::liveBrowserCount() > 0) {
+		if (!allClosed) {
 			fprintf(stderr,
 			        "[webview_cef] WARNING: browsers still open after 2s; "
 			        "forcing CefShutdown anyway.\n");
@@ -1022,8 +1050,11 @@ namespace webview_cef {
 		CefShutdown();
 		g_cefInitOk = false;
 #ifdef _WIN32
-		// Mark this run as cleanly shut down (see kCleanExitMarker).
-		if (!g_cacheDir.empty()) {
+		// Mark this run as cleanly shut down (see kCleanExitMarker) — but only
+		// when the browsers really drained. A forced CefShutdown is the very
+		// case the marker warns the next run about, so claiming a clean exit
+		// there would hide a torn GPU/shader cache instead of dropping it.
+		if (allClosed && !g_cacheDir.empty()) {
 			std::ofstream(std::filesystem::path(g_cacheDir) / kCleanExitMarker)
 			    << '1';
 		}

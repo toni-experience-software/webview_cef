@@ -69,7 +69,13 @@ public:
     // closes are async (CloseBrowser posts to CEF's UI thread); CefShutdown
     // while any are alive is undefined — shutdown waits on this reaching zero.
     static int liveBrowserCount();
-    
+
+    // Requests a close of every live browser, from any thread — closes must be
+    // issued on the CEF UI thread, so this marshals itself there. Static
+    // because shutdown has no handler instance in hand, and every handler's
+    // browsers have to go before CefShutdown.
+    static void closeAllBrowsersForShutdown();
+
     // CefClient methods:
     virtual CefRefPtr<CefDisplayHandler> GetDisplayHandler() override {
         return this;

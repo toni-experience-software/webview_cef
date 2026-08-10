@@ -11,6 +11,7 @@
 #include <chrono>
 #include <unordered_map>
 #include <cstdint>
+#include <vector>
 
 #include "include/base/cef_callback.h"
 #include "include/cef_app.h"
@@ -47,6 +48,13 @@ CefRefPtr<CefBrowser> current_focused_browser_ = nullptr;
 // decremented in OnBeforeClose — both fire for every browser, popups and
 // DevTools included). stopCEF() waits on this before CefShutdown.
 std::atomic<int> live_browser_count_{0};
+
+// The same browsers, so shutdown can close them without a handler in hand
+// (stopCEF() is free-standing; the handlers belong to the plugin instances).
+// Only ever touched on the CEF UI thread — OnAfterCreated, OnBeforeClose and
+// closeAllBrowsersForShutdown's task — so it needs no lock, and the held
+// reference keeps each browser alive until its close completes.
+std::vector<CefRefPtr<CefBrowser>> live_browsers_;
 
 // Returns a data: URI with the specified contents.
 std::string GetDataURI(const std::string& data, const std::string& mime_type) {
@@ -158,9 +166,27 @@ int WebviewHandler::liveBrowserCount() {
     return live_browser_count_.load();
 }
 
+void WebviewHandler::closeAllBrowsersForShutdown() {
+    if (!CefCurrentlyOn(TID_UI)) {
+        CefPostTask(TID_UI,
+                    base::BindOnce(&WebviewHandler::closeAllBrowsersForShutdown));
+        return;
+    }
+    // Move the list out rather than walking it in place: CloseBrowser can run
+    // OnBeforeClose synchronously (which erases from it), and it drops our
+    // references when this returns, so none survive into CefShutdown. CEF keeps
+    // its own references for the whole close sequence.
+    std::vector<CefRefPtr<CefBrowser>> browsers;
+    browsers.swap(live_browsers_);
+    for (const auto& browser : browsers) {
+        browser->GetHost()->CloseBrowser(true);
+    }
+}
+
 void WebviewHandler::OnAfterCreated(CefRefPtr<CefBrowser> browser) {
     CEF_REQUIRE_UI_THREAD();
     live_browser_count_.fetch_add(1);
+    live_browsers_.push_back(browser);
     if (!browser->IsPopup()) {
         browser_map_.emplace(browser->GetIdentifier(), browser_info());
         browser_map_[browser->GetIdentifier()].browser = browser;
@@ -177,6 +203,12 @@ bool WebviewHandler::DoClose(CefRefPtr<CefBrowser> browser) {
 void WebviewHandler::OnBeforeClose(CefRefPtr<CefBrowser> browser) {
     CEF_REQUIRE_UI_THREAD();
     live_browser_count_.fetch_sub(1);
+    for (auto it = live_browsers_.begin(); it != live_browsers_.end(); ++it) {
+        if ((*it)->IsSame(browser)) {
+            live_browsers_.erase(it);
+            break;
+        }
+    }
 }
 
 bool WebviewHandler::OnBeforePopup(CefRefPtr<CefBrowser> browser,

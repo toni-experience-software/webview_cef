@@ -198,8 +198,14 @@ class WebviewManager extends ValueNotifier<bool> {
     return pluginChannel.invokeMethod('visitUrlCookies', [domain, isHttpOnly]);
   }
 
+  /// Shuts CEF down. Only call this when the app is quitting: nothing can be
+  /// created afterwards.
+  ///
+  /// The native side closes any still-open browsers and waits for them, because
+  /// shutting CEF down with a live browser is undefined and can hang the
+  /// process. That blocks the platform thread — normally for a few
+  /// milliseconds, at worst for two seconds — so this is teardown-only.
   Future<void> quit() async {
-    //only call this method when you want to quit the app
     assert(value);
     return pluginChannel.invokeMethod('quit');
   }
