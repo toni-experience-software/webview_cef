@@ -52,7 +52,11 @@ namespace webview_cef {
 		std::error_code ec;
 		for (fs::recursive_directory_iterator it(cacheDir, ec), end;
 		     !ec && it != end; it.increment(ec)) {
-			if (it->is_directory(ec) &&
+			// Deliberately a separate error_code: reusing |ec| would let one
+			// failed stat trip the loop's own !ec guard and silently abandon
+			// the sweep, leaving the caches this exists to remove.
+			std::error_code dec;
+			if (it->is_directory(dec) && !dec &&
 			    kVolatile.count(it->path().filename().wstring()) != 0) {
 				doomed.push_back(it->path());
 				it.disable_recursion_pending();

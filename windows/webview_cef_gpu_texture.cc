@@ -19,14 +19,6 @@ namespace webview_cef {
                     return kFlutterDesktopPixelFormatBGRA8888;
             }
         }
-
-        // Holds a reference to the bridge texture for the lifetime of one Flutter
-        // "obtain descriptor" call so the shared handle stays valid until Flutter
-        // has opened it. The engine invokes release_callback when it is done.
-        struct DescriptorHolder {
-            ComPtr<ID3D11Texture2D> texture;
-            FlutterDesktopGpuSurfaceDescriptor descriptor = {};
-        };
     }  // namespace
 
     WebviewGpuTextureRenderer::WebviewGpuTextureRenderer(FlutterDesktopTextureRegistrarRef registrar)
