@@ -175,13 +175,21 @@ public:
     // shared texture, which would otherwise be a silent black webview.
     void warnIfNoAcceleratedFrame();
 
-    void sendScrollEvent(int browserId, int x, int y, double deltaX, double deltaY);
+    // |modifiers| is a cef_event_flags_t mask (held keys + mouse buttons).
+    // A synthesized trackpad pinch arrives with EVENTFLAG_CONTROL_DOWN set,
+    // which is Chromium's own encoding of a magnify gesture.
+    void sendScrollEvent(int browserId, int x, int y, double deltaX, double deltaY,
+                         uint32_t modifiers);
     // One touch contact update; |id| is stable per finger. Phase mapping
     // shared with the Dart layer: 0=down, 1=move, 2=up, 3=cancel.
     void sendTouchEvent(int browserId, int id, int phase, double x, double y, double pressure);
     void changeSize(int browserId, float a_dpi, int width, int height);
-    void cursorClick(int browserId, int x, int y, bool up);
-    void cursorMove(int browserId, int x, int y, bool dragging);
+    // |button| is a cef_mouse_button_type_t (0=left, 1=middle, 2=right) and
+    // |clickCount| the consecutive-click index — Blink only synthesizes
+    // `dblclick` when it is told the click count is 2, it never derives one.
+    void cursorClick(int browserId, int x, int y, bool up, int button,
+                     int clickCount, uint32_t modifiers);
+    void cursorMove(int browserId, int x, int y, bool dragging, uint32_t modifiers);
     void sendKeyEvent(CefKeyEvent& ev);
     void loadUrl(int browserId, std::string url);
     void goForward(int browserId);

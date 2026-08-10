@@ -464,7 +464,12 @@ namespace webview_cef {
 			auto y = webview_value_get_int(webview_value_get_list_value(values, 2));
 			double deltaX = asDouble(webview_value_get_list_value(values, 3));
 			double deltaY = asDouble(webview_value_get_list_value(values, 4));
-			m_handler->sendScrollEvent(browserId, (int)x, (int)y, deltaX, deltaY);
+			// Optional trailing modifiers, so the older 5-argument encoding
+			// still works. EVENTFLAG_CONTROL_DOWN marks a magnify gesture.
+			uint32_t modifiers = webview_value_get_len(values) > 5
+				? (uint32_t)webview_value_get_int(webview_value_get_list_value(values, 5))
+				: 0;
+			m_handler->sendScrollEvent(browserId, (int)x, (int)y, deltaX, deltaY, modifiers);
 			result(1, nullptr);
 		}
 		else if (name.compare("sendTouchEvent") == 0) {
@@ -802,26 +807,35 @@ namespace webview_cef {
 	}
 	
 	int WebviewPlugin::cursorAction(WValue *args, std::string name) {
-		if (!args || webview_value_get_len(args) != 3) {
+		// Args: [browserId, x, y] plus, for the click verbs, [modifiers, button,
+		// clickCount] and for the move verbs [modifiers]. The trailing values are
+		// optional so a host on the older 3-argument encoding keeps working.
+		const size_t len = args ? (size_t)webview_value_get_len(args) : 0;
+		if (len < 3) {
 			return 0;
 		}
-		int browserId = int(webview_value_get_int(webview_value_get_list_value(args, 0)));
-		int x = int(webview_value_get_int(webview_value_get_list_value(args, 1)));
-		int y = int(webview_value_get_int(webview_value_get_list_value(args, 2)));
+		auto at = [&](size_t i, int fallback) -> int {
+			return i < len ? int(webview_value_get_int(webview_value_get_list_value(args, i)))
+			               : fallback;
+		};
+		int browserId = at(0, 0);
+		int x = at(1, 0);
+		int y = at(2, 0);
 		if (!x && !y) {
 			return 0;
 		}
+		uint32_t modifiers = (uint32_t)at(3, 0);
 		if (name.compare("cursorClickDown") == 0) {
-			m_handler->cursorClick(browserId, x, y, false);
+			m_handler->cursorClick(browserId, x, y, false, at(4, 0), at(5, 1), modifiers);
 		}
 		else if (name.compare("cursorClickUp") == 0) {
-			m_handler->cursorClick(browserId, x, y, true);
+			m_handler->cursorClick(browserId, x, y, true, at(4, 0), at(5, 1), modifiers);
 		}
 		else if (name.compare("cursorMove") == 0) {
-			m_handler->cursorMove(browserId, x, y, false);
+			m_handler->cursorMove(browserId, x, y, false, modifiers);
 		}
 		else if (name.compare("cursorDragging") == 0) {
-			m_handler->cursorMove(browserId, x, y, true);
+			m_handler->cursorMove(browserId, x, y, true, modifiers);
 		}
 		return 1;
 	}

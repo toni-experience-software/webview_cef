@@ -365,19 +365,28 @@ void WebviewHandler::sendExternalBeginFrame() {
 #endif
 }
 
-void WebviewHandler::sendScrollEvent(int browserId, int x, int y, double deltaX, double deltaY) {
+void WebviewHandler::sendScrollEvent(int browserId, int x, int y, double deltaX, double deltaY,
+                                     uint32_t modifiers) {
 
     auto it = browser_map_.find(browserId);
     if (it != browser_map_.end()) {
         CefMouseEvent ev;
         ev.x = x;
         ev.y = y;
+        ev.modifiers = modifiers;
 
 #ifndef __APPLE__
         // The scrolling direction on Windows and Linux is different from MacOS.
         // Deltas are forwarded 1:1 (matching WebView2/Chrome feel) — the
         // upstream 10x boost made canvas/map zoom wildly over-sensitive.
-        deltaY = -deltaY;
+        //
+        // A zoom gesture is exempt: it is not a Flutter scroll delta whose sign
+        // convention differs per platform, it is a magnitude the Dart layer
+        // synthesizes itself (pinch) or a deliberate ctrl+wheel. Negating it
+        // would invert pinch-to-zoom on Windows/Linux only.
+        if ((modifiers & EVENTFLAG_CONTROL_DOWN) == 0) {
+            deltaY = -deltaY;
+        }
 #endif
         it->second.browser->GetHost()->SendMouseWheelEvent(
             ev, (int)std::lround(deltaX), (int)std::lround(deltaY));
@@ -416,33 +425,52 @@ void WebviewHandler::changeSize(int browserId, float a_dpi, int w, int h)
     }
 }
 
-void WebviewHandler::cursorClick(int browserId, int x, int y, bool up)
+namespace {
+// Guards against a malformed |button| from the channel; CEF has no "unknown".
+CefBrowserHost::MouseButtonType ToCefButton(int button) {
+    switch (button) {
+        case 1: return CefBrowserHost::MouseButtonType::MBT_MIDDLE;
+        case 2: return CefBrowserHost::MouseButtonType::MBT_RIGHT;
+        default: return CefBrowserHost::MouseButtonType::MBT_LEFT;
+    }
+}
+}  // namespace
+
+void WebviewHandler::cursorClick(int browserId, int x, int y, bool up, int button,
+                                 int clickCount, uint32_t modifiers)
 {
     auto it = browser_map_.find(browserId);
     if (it != browser_map_.end()) {
         CefMouseEvent ev;
         ev.x = x;
         ev.y = y;
-        ev.modifiers = EVENTFLAG_LEFT_MOUSE_BUTTON;
+        ev.modifiers = modifiers;
         if(up && it->second.is_dragging) {
             it->second.browser->GetHost()->DragTargetDrop(ev);
             it->second.browser->GetHost()->DragSourceSystemDragEnded();
             it->second.is_dragging = false;
         } else {
-            it->second.browser->GetHost()->SendMouseClickEvent(ev, CefBrowserHost::MouseButtonType::MBT_LEFT, up, 1);
+            it->second.browser->GetHost()->SendMouseClickEvent(
+                ev, ToCefButton(button), up, clickCount < 1 ? 1 : clickCount);
         }
     }
 }
 
-void WebviewHandler::cursorMove(int browserId, int x , int y, bool dragging)
+void WebviewHandler::cursorMove(int browserId, int x , int y, bool dragging, uint32_t modifiers)
 {
     auto it = browser_map_.find(browserId);
     if (it != browser_map_.end()) {
         CefMouseEvent ev;
         ev.x = x;
         ev.y = y;
-        if(dragging) {
-            ev.modifiers = EVENTFLAG_LEFT_MOUSE_BUTTON;
+        // The held buttons ride in |modifiers|; |dragging| only selects the
+        // drag-and-drop path below. Older callers that pass no button flags
+        // still get a left-button drag so behaviour doesn't regress.
+        ev.modifiers = modifiers;
+        if(dragging && (modifiers & (EVENTFLAG_LEFT_MOUSE_BUTTON |
+                                     EVENTFLAG_MIDDLE_MOUSE_BUTTON |
+                                     EVENTFLAG_RIGHT_MOUSE_BUTTON)) == 0) {
+            ev.modifiers |= EVENTFLAG_LEFT_MOUSE_BUTTON;
         }
         if(it->second.is_dragging && dragging) {
             it->second.browser->GetHost()->DragTargetDragOver(ev, DRAG_OPERATION_EVERY);
