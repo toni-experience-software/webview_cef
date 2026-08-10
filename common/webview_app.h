@@ -39,6 +39,9 @@ public:
         CefRefPtr<CefCommandLine> command_line) override;
     void SetProcessMode(uint32_t uMode);
     void SetEnableGPU(bool bEnable);
+    // Call before CefInitialize when CefSettings.cache_path is set, so the
+    // GPU shader disk cache is left enabled (it lives under the cache path).
+    void SetHasPersistentCache(bool bHasCache);
     void OnContextInitialized() override;
     // CefRefPtr<CefClient> GetDefaultClient() override;
     void OnBeforeChildProcessLaunch(CefRefPtr<CefCommandLine> command_line) override;
@@ -77,6 +80,7 @@ public:
 private:
     uint32_t                        m_uMode = 1;                        //process mode
     bool                            m_bEnableGPU = false;               //enable gpu
+    bool                            m_bHasPersistentCache = false;      //CefSettings.cache_path is set
     CefString                       m_strFilterDomain;                  //insecure domain whitelist       
 
     CefRefPtr<WebviewHandler>       m_handler;                          //webview handler for main process

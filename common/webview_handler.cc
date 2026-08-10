@@ -37,9 +37,16 @@ namespace stringpatch
 
 #include "webview_js_handler.h"
 
+#include <atomic>
+
 namespace {
 // The only browser that currently get focused
 CefRefPtr<CefBrowser> current_focused_browser_ = nullptr;
+
+// Browsers created and not yet fully closed (incremented in OnAfterCreated,
+// decremented in OnBeforeClose — both fire for every browser, popups and
+// DevTools included). stopCEF() waits on this before CefShutdown.
+std::atomic<int> live_browser_count_{0};
 
 // Returns a data: URI with the specified contents.
 std::string GetDataURI(const std::string& data, const std::string& mime_type) {
@@ -147,8 +154,13 @@ bool WebviewHandler::OnConsoleMessage(CefRefPtr<CefBrowser> browser,
     return false;
 }
 
+int WebviewHandler::liveBrowserCount() {
+    return live_browser_count_.load();
+}
+
 void WebviewHandler::OnAfterCreated(CefRefPtr<CefBrowser> browser) {
     CEF_REQUIRE_UI_THREAD();
+    live_browser_count_.fetch_add(1);
     if (!browser->IsPopup()) {
         browser_map_.emplace(browser->GetIdentifier(), browser_info());
         browser_map_[browser->GetIdentifier()].browser = browser;
@@ -164,6 +176,7 @@ bool WebviewHandler::DoClose(CefRefPtr<CefBrowser> browser) {
 
 void WebviewHandler::OnBeforeClose(CefRefPtr<CefBrowser> browser) {
     CEF_REQUIRE_UI_THREAD();
+    live_browser_count_.fetch_sub(1);
 }
 
 bool WebviewHandler::OnBeforePopup(CefRefPtr<CefBrowser> browser,
