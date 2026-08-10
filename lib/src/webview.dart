@@ -237,6 +237,14 @@ class WebViewController extends ValueNotifier<bool> {
         .invokeMethod('evaluateJavascript', [_browserId, code]);
   }
 
+  // Pointer moves are forwarded per input event, unthrottled — the same policy
+  // as flutter_inappwebview's WebView2 view. Chromium coalesces mouse moves
+  // per BeginFrame internally (Blink processes the latest state each frame on
+  // the display's clock), so host-side throttling is redundant and any
+  // wall-clock throttle aliases against the frame grid, causing visible pan
+  // jitter (Windows Timer resolution is ~15.6 ms → irregular ~64 Hz sampling
+  // beating against 60 Hz frames).
+
   /// Moves the virtual cursor to [position].
   Future<void> _cursorMove(Offset position) async {
     if (_isDisposed) {
@@ -274,8 +282,29 @@ class WebViewController extends ValueNotifier<bool> {
         [_browserId, position.dx.round(), position.dy.round()]);
   }
 
+  /// Forwards one touch contact update to CEF's touch pipeline.
+  ///
+  /// [id] is a small slot id stable for the lifetime of one finger (not
+  /// Flutter's monotonically growing `event.pointer`). Phase mapping shared
+  /// with the native side: 0=down, 1=move, 2=up, 3=cancel. Positions and
+  /// pressure travel as doubles (the native decoder distinguishes int/double;
+  /// a mismatch reads 0).
+  Future<void> _sendTouchEvent(
+      int id, int phase, Offset position, double pressure) async {
+    if (_isDisposed) {
+      return;
+    }
+    assert(value);
+    return _pluginChannel.invokeMethod('sendTouchEvent',
+        [_browserId, id, phase, position.dx, position.dy, pressure]);
+  }
+
   /// Sets the horizontal and vertical scroll delta.
-  Future<void> _setScrollDelta(Offset position, int dx, int dy) async {
+  ///
+  /// Deltas are passed as unscaled doubles — the native side forwards them 1:1
+  /// (upstream int-rounded and multiplied by 10, which made map/canvas zoom
+  /// wildly over-sensitive).
+  Future<void> _setScrollDelta(Offset position, double dx, double dy) async {
     if (_isDisposed) {
       return;
     }
@@ -333,6 +362,27 @@ class WebViewState extends State<WebView> with WebeViewTextInput {
   bool? _hasNativeKeySupport;
 
   WebViewController get _controller => widget.controller;
+
+  // Touch contact slots: Flutter's `event.pointer` grows monotonically for
+  // the lifetime of the app, but CEF tracks contacts by a small id that must
+  // stay stable from PRESSED to RELEASED/CANCELLED. Map each active pointer
+  // to the lowest free slot; free it on up/cancel.
+  final Map<int, int> _touchSlots = <int, int>{};
+
+  int _acquireTouchSlot(int pointer) {
+    return _touchSlots.putIfAbsent(pointer, () {
+      var slot = 0;
+      while (_touchSlots.containsValue(slot)) {
+        slot++;
+      }
+      return slot;
+    });
+  }
+
+  // CEF expects 0..1 with an actual contact force; digitizers without a
+  // pressure sensor report 0 through Flutter.
+  double _touchPressure(PointerEvent ev) =>
+      ev.pressure > 0 ? ev.pressure.clamp(0.0, 1.0).toDouble() : 1.0;
 
   @override
   updateEditingValueWithDeltas(List<TextEditingDelta> textEditingDeltas) {
@@ -565,6 +615,8 @@ class WebViewState extends State<WebView> with WebeViewTextInput {
             _tooltip?.cursorOffset = ev.position;
           },
           onPointerDown: (ev) {
+            // Focus grab applies to every pointer kind — keyboard/IME routing
+            // depends on it.
             if (!_focusNode.hasFocus) {
               _controller._onImeCompositionRangeChangedMessage?.call(0, 0, 0);
               _focusNode.requestFocus();
@@ -574,23 +626,56 @@ class WebViewState extends State<WebView> with WebeViewTextInput {
                 }
               });
             }
-            _controller._cursorClickDown(ev.localPosition);
+            if (ev.kind == PointerDeviceKind.touch) {
+              _controller._sendTouchEvent(_acquireTouchSlot(ev.pointer), 0,
+                  ev.localPosition, _touchPressure(ev));
+            } else {
+              _controller._cursorClickDown(ev.localPosition);
+            }
           },
           onPointerUp: (ev) {
-            _controller._cursorClickUp(ev.localPosition);
+            if (ev.kind == PointerDeviceKind.touch) {
+              final slot = _touchSlots.remove(ev.pointer);
+              if (slot != null) {
+                _controller._sendTouchEvent(
+                    slot, 2, ev.localPosition, _touchPressure(ev));
+              }
+            } else {
+              _controller._cursorClickUp(ev.localPosition);
+            }
+          },
+          onPointerCancel: (ev) {
+            // Without the CANCELLED event a stuck contact wedges Chromium's
+            // gesture recognizer. Non-touch cancels have no mouse-path
+            // equivalent and are ignored, as before.
+            if (ev.kind == PointerDeviceKind.touch) {
+              final slot = _touchSlots.remove(ev.pointer);
+              if (slot != null) {
+                _controller._sendTouchEvent(
+                    slot, 3, ev.localPosition, _touchPressure(ev));
+              }
+            }
           },
           onPointerMove: (ev) {
-            _controller._cursorDragging(ev.localPosition);
+            if (ev.kind == PointerDeviceKind.touch) {
+              final slot = _touchSlots[ev.pointer];
+              if (slot != null) {
+                _controller._sendTouchEvent(
+                    slot, 1, ev.localPosition, _touchPressure(ev));
+              }
+            } else {
+              _controller._cursorDragging(ev.localPosition);
+            }
           },
           onPointerSignal: (signal) {
             if (signal is PointerScrollEvent) {
               _controller._setScrollDelta(signal.localPosition,
-                  signal.scrollDelta.dx.round(), signal.scrollDelta.dy.round());
+                  signal.scrollDelta.dx, signal.scrollDelta.dy);
             }
           },
           onPointerPanZoomUpdate: (event) {
-            _controller._setScrollDelta(event.localPosition,
-                event.panDelta.dx.round(), event.panDelta.dy.round());
+            _controller._setScrollDelta(
+                event.localPosition, event.panDelta.dx, event.panDelta.dy);
           },
           child: MouseRegion(
             cursor: _mouseType,

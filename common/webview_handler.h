@@ -164,7 +164,10 @@ public:
     // shared texture, which would otherwise be a silent black webview.
     void warnIfNoAcceleratedFrame();
 
-    void sendScrollEvent(int browserId, int x, int y, int deltaX, int deltaY);
+    void sendScrollEvent(int browserId, int x, int y, double deltaX, double deltaY);
+    // One touch contact update; |id| is stable per finger. Phase mapping
+    // shared with the Dart layer: 0=down, 1=move, 2=up, 3=cancel.
+    void sendTouchEvent(int browserId, int id, int phase, double x, double y, double pressure);
     void changeSize(int browserId, float a_dpi, int width, int height);
     void cursorClick(int browserId, int x, int y, bool up);
     void cursorMove(int browserId, int x, int y, bool dragging);

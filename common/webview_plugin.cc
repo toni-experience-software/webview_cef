@@ -323,12 +323,47 @@ namespace webview_cef {
 			result(cursorAction(values, name), nullptr);
 		}
 		else if (name.compare("setScrollDelta") == 0) {
+			// Deltas arrive as unscaled doubles from Dart (see webview.dart);
+			// tolerate ints for any caller still sending the legacy encoding.
+			auto asDouble = [](WValue* v) -> double {
+				switch (webview_value_get_type(v)) {
+					case Webview_Value_Type_Double:
+						return webview_value_get_double(v);
+					case Webview_Value_Type_Float:
+						return (double)webview_value_get_float(v);
+					default:
+						return (double)webview_value_get_int(v);
+				}
+			};
 			int browserId = int(webview_value_get_int(webview_value_get_list_value(values, 0)));
 			auto x = webview_value_get_int(webview_value_get_list_value(values, 1));
 			auto y = webview_value_get_int(webview_value_get_list_value(values, 2));
-			auto deltaX = webview_value_get_int(webview_value_get_list_value(values, 3));
-			auto deltaY = webview_value_get_int(webview_value_get_list_value(values, 4));
-			m_handler->sendScrollEvent(browserId, (int)x, (int)y, (int)deltaX, (int)deltaY);
+			double deltaX = asDouble(webview_value_get_list_value(values, 3));
+			double deltaY = asDouble(webview_value_get_list_value(values, 4));
+			m_handler->sendScrollEvent(browserId, (int)x, (int)y, deltaX, deltaY);
+			result(1, nullptr);
+		}
+		else if (name.compare("sendTouchEvent") == 0) {
+			// Args: [browserId, id, phase, x, y, pressure]. Phase mapping shared
+			// with the Dart layer: 0=down, 1=move, 2=up, 3=cancel. Positions and
+			// pressure arrive as doubles (tolerate ints like setScrollDelta does).
+			auto asDouble = [](WValue* v) -> double {
+				switch (webview_value_get_type(v)) {
+					case Webview_Value_Type_Double:
+						return webview_value_get_double(v);
+					case Webview_Value_Type_Float:
+						return (double)webview_value_get_float(v);
+					default:
+						return (double)webview_value_get_int(v);
+				}
+			};
+			int browserId = int(webview_value_get_int(webview_value_get_list_value(values, 0)));
+			int id = int(webview_value_get_int(webview_value_get_list_value(values, 1)));
+			int phase = int(webview_value_get_int(webview_value_get_list_value(values, 2)));
+			double x = asDouble(webview_value_get_list_value(values, 3));
+			double y = asDouble(webview_value_get_list_value(values, 4));
+			double pressure = asDouble(webview_value_get_list_value(values, 5));
+			m_handler->sendTouchEvent(browserId, id, phase, x, y, pressure);
 			result(1, nullptr);
 		}
 		else if (name.compare("goForward") == 0) {

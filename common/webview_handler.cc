@@ -4,6 +4,7 @@
 
 #include "webview_handler.h"
 
+#include <cmath>
 #include <sstream>
 #include <string>
 #include <iostream>
@@ -319,7 +320,7 @@ void WebviewHandler::sendExternalBeginFrame() {
 #endif
 }
 
-void WebviewHandler::sendScrollEvent(int browserId, int x, int y, int deltaX, int deltaY) {
+void WebviewHandler::sendScrollEvent(int browserId, int x, int y, double deltaX, double deltaY) {
 
     auto it = browser_map_.find(browserId);
     if (it != browser_map_.end()) {
@@ -328,16 +329,35 @@ void WebviewHandler::sendScrollEvent(int browserId, int x, int y, int deltaX, in
         ev.y = y;
 
 #ifndef __APPLE__
-        // The scrolling direction on Windows and Linux is different from MacOS
+        // The scrolling direction on Windows and Linux is different from MacOS.
+        // Deltas are forwarded 1:1 (matching WebView2/Chrome feel) — the
+        // upstream 10x boost made canvas/map zoom wildly over-sensitive.
         deltaY = -deltaY;
-        // Flutter scrolls too slowly, it looks more normal by 10x default speed.
-        it->second.browser->GetHost()->SendMouseWheelEvent(ev, deltaX * 10, deltaY * 10);
-#else
-        it->second.browser->GetHost()->SendMouseWheelEvent(ev, deltaX, deltaY);
 #endif
-
-
+        it->second.browser->GetHost()->SendMouseWheelEvent(
+            ev, (int)std::lround(deltaX), (int)std::lround(deltaY));
     }
+}
+
+void WebviewHandler::sendTouchEvent(int browserId, int id, int phase, double x, double y, double pressure) {
+    auto it = browser_map_.find(browserId);
+    if (it == browser_map_.end()) {
+        return;
+    }
+    CefTouchEvent ev;
+    ev.id = id;
+    ev.x = (float)x;
+    ev.y = (float)y;
+    switch (phase) {
+        case 0: ev.type = CEF_TET_PRESSED; break;
+        case 1: ev.type = CEF_TET_MOVED; break;
+        case 2: ev.type = CEF_TET_RELEASED; break;
+        case 3: ev.type = CEF_TET_CANCELLED; break;
+        default: return;
+    }
+    ev.pointer_type = CEF_POINTER_TYPE_TOUCH;
+    ev.pressure = pressure > 0.0 ? (float)pressure : 1.0f;
+    it->second.browser->GetHost()->SendTouchEvent(ev);
 }
 
 void WebviewHandler::changeSize(int browserId, float a_dpi, int w, int h)
