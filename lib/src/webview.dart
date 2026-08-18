@@ -30,6 +30,53 @@ const int eventFlagNumLockOn = 1 << 8;
 const int eventFlagIsKeyPad = 1 << 9;
 const int eventFlagIsLeft = 1 << 10;
 const int eventFlagIsRight = 1 << 11;
+const int eventFlagAltGrDown = 1 << 12;
+const int eventFlagIsRepeat = 1 << 13;
+const int eventFlagPrecisionScrollingDelta = 1 << 14;
+const int eventFlagScrollByPage = 1 << 15;
+
+// CEF mouse buttons (cef_mouse_button_type_t).
+const int mouseButtonLeft = 0;
+const int mouseButtonMiddle = 1;
+const int mouseButtonRight = 2;
+
+/// Modifier flags for the mouse/wheel path, read from the live keyboard state.
+///
+/// Chromium expects every mouse event to carry the modifiers in force at the
+/// time of the event: without them a page can't distinguish shift-drag
+/// (Mapbox `boxZoom`), ctrl-drag (`dragRotate`) or shift-wheel (horizontal
+/// scroll) from their plain variants.
+int _keyboardModifiers() {
+  final keyboard = HardwareKeyboard.instance;
+  var modifiers = eventFlagNone;
+  if (keyboard.isShiftPressed) modifiers |= eventFlagShiftDown;
+  if (keyboard.isControlPressed) modifiers |= eventFlagControlDown;
+  if (keyboard.isAltPressed) modifiers |= eventFlagAltDown;
+  if (keyboard.isMetaPressed) modifiers |= eventFlagCommandDown;
+  return modifiers;
+}
+
+/// Flutter's pressed-button bitfield → CEF's button modifier flags.
+///
+/// Chromium reads the held buttons off the modifiers, so a drag is only a drag
+/// if the move events say which button is down.
+int _buttonModifiers(int buttons) {
+  var modifiers = eventFlagNone;
+  if (buttons & kPrimaryButton != 0) modifiers |= eventFlagLeftMouseButton;
+  if (buttons & kMiddleMouseButton != 0) {
+    modifiers |= eventFlagMiddleMouseButton;
+  }
+  if (buttons & kSecondaryButton != 0) modifiers |= eventFlagRightMouseButton;
+  return modifiers;
+}
+
+/// The CEF button type for a Flutter pressed-button bitfield. Chromium only
+/// tracks one button per click event; primary wins when several are held.
+int _mouseButtonOf(int buttons) {
+  if (buttons & kSecondaryButton != 0) return mouseButtonRight;
+  if (buttons & kMiddleMouseButton != 0) return mouseButtonMiddle;
+  return mouseButtonLeft;
+}
 
 class WebViewController extends ValueNotifier<bool> {
   WebViewController(this._pluginChannel, this._index, {Widget? loading})
@@ -237,51 +284,109 @@ class WebViewController extends ValueNotifier<bool> {
         .invokeMethod('evaluateJavascript', [_browserId, code]);
   }
 
+  // Pointer moves are forwarded per input event, unthrottled — the same policy
+  // as flutter_inappwebview's WebView2 view. Chromium coalesces mouse moves
+  // per BeginFrame internally (Blink processes the latest state each frame on
+  // the display's clock), so host-side throttling is redundant and any
+  // wall-clock throttle aliases against the frame grid, causing visible pan
+  // jitter (Windows Timer resolution is ~15.6 ms → irregular ~64 Hz sampling
+  // beating against 60 Hz frames).
+
   /// Moves the virtual cursor to [position].
-  Future<void> _cursorMove(Offset position) async {
+  ///
+  /// [modifiers] is a CEF `cef_event_flags_t` mask carrying the held keyboard
+  /// modifiers and mouse buttons; the native side forwards it verbatim.
+  Future<void> _cursorMove(Offset position, int modifiers) async {
     if (_isDisposed) {
       return;
     }
     assert(value);
-    return _pluginChannel.invokeMethod(
-        'cursorMove', [_browserId, position.dx.round(), position.dy.round()]);
+    return _pluginChannel.invokeMethod('cursorMove',
+        [_browserId, position.dx.round(), position.dy.round(), modifiers]);
   }
 
-  Future<void> _cursorDragging(Offset position) async {
+  Future<void> _cursorDragging(Offset position, int modifiers) async {
     if (_isDisposed) {
       return;
     }
     assert(value);
     return _pluginChannel.invokeMethod('cursorDragging',
-        [_browserId, position.dx.round(), position.dy.round()]);
+        [_browserId, position.dx.round(), position.dy.round(), modifiers]);
   }
 
-  Future<void> _cursorClickDown(Offset position) async {
+  /// [button] is a `cef_mouse_button_type_t` value (0=left, 1=middle, 2=right)
+  /// and [clickCount] is the consecutive-click index Chromium needs to
+  /// synthesize `dblclick` (2) and triple-click (3) from a plain click stream.
+  Future<void> _cursorClickDown(
+      Offset position, int modifiers, int button, int clickCount) async {
     if (_isDisposed) {
       return;
     }
     assert(value);
-    return _pluginChannel.invokeMethod('cursorClickDown',
-        [_browserId, position.dx.round(), position.dy.round()]);
+    return _pluginChannel.invokeMethod('cursorClickDown', [
+      _browserId,
+      position.dx.round(),
+      position.dy.round(),
+      modifiers,
+      button,
+      clickCount,
+    ]);
   }
 
-  Future<void> _cursorClickUp(Offset position) async {
+  Future<void> _cursorClickUp(
+      Offset position, int modifiers, int button, int clickCount) async {
     if (_isDisposed) {
       return;
     }
     assert(value);
-    return _pluginChannel.invokeMethod('cursorClickUp',
-        [_browserId, position.dx.round(), position.dy.round()]);
+    return _pluginChannel.invokeMethod('cursorClickUp', [
+      _browserId,
+      position.dx.round(),
+      position.dy.round(),
+      modifiers,
+      button,
+      clickCount,
+    ]);
+  }
+
+  /// Forwards one touch contact update to CEF's touch pipeline.
+  ///
+  /// [id] is a small slot id stable for the lifetime of one finger (not
+  /// Flutter's monotonically growing `event.pointer`). Phase mapping shared
+  /// with the native side: 0=down, 1=move, 2=up, 3=cancel. Positions and
+  /// pressure travel as doubles (the native decoder distinguishes int/double;
+  /// a mismatch reads 0).
+  Future<void> _sendTouchEvent(
+      int id, int phase, Offset position, double pressure) async {
+    if (_isDisposed) {
+      return;
+    }
+    assert(value);
+    return _pluginChannel.invokeMethod('sendTouchEvent',
+        [_browserId, id, phase, position.dx, position.dy, pressure]);
   }
 
   /// Sets the horizontal and vertical scroll delta.
-  Future<void> _setScrollDelta(Offset position, int dx, int dy) async {
+  ///
+  /// Deltas are passed as unscaled doubles — the native side forwards them 1:1
+  /// (upstream int-rounded and multiplied by 10, which made map/canvas zoom
+  /// wildly over-sensitive). [modifiers] carries the keyboard state plus,
+  /// for a synthesized trackpad pinch, [eventFlagControlDown] — Chromium's own
+  /// convention for "this wheel event is a magnify gesture".
+  Future<void> _setScrollDelta(
+      Offset position, double dx, double dy, int modifiers) async {
     if (_isDisposed) {
       return;
     }
     assert(value);
-    return _pluginChannel.invokeMethod('setScrollDelta',
-        [_browserId, position.dx.round(), position.dy.round(), dx, dy]);
+    return _pluginChannel.invokeMethod('setScrollDelta', [
+      _browserId,
+      position.dx.round(),
+      position.dy.round(),
+      dx,
+      dy,
+      modifiers,
+    ]);
   }
 
   /// Sets the surface size to the provided [size].
@@ -333,6 +438,96 @@ class WebViewState extends State<WebView> with WebeViewTextInput {
   bool? _hasNativeKeySupport;
 
   WebViewController get _controller => widget.controller;
+
+  // Touch contact slots: Flutter's `event.pointer` grows monotonically for
+  // the lifetime of the app, but CEF tracks contacts by a small id that must
+  // stay stable from PRESSED to RELEASED/CANCELLED. Map each active pointer
+  // to the lowest free slot; free it on up/cancel.
+  final Map<int, int> _touchSlots = <int, int>{};
+
+  int _acquireTouchSlot(int pointer) {
+    return _touchSlots.putIfAbsent(pointer, () {
+      var slot = 0;
+      while (_touchSlots.containsValue(slot)) {
+        slot++;
+      }
+      return slot;
+    });
+  }
+
+  // CEF expects 0..1 with an actual contact force; digitizers without a
+  // pressure sensor report 0 through Flutter.
+  double _touchPressure(PointerEvent ev) =>
+      ev.pressure > 0 ? ev.pressure.clamp(0.0, 1.0).toDouble() : 1.0;
+
+  // Which CEF button each active mouse pointer pressed. A `PointerUpEvent`
+  // reports `buttons == 0`, so the release must be told what it ends.
+  final Map<int, int> _pressedButtons = <int, int>{};
+
+  // Consecutive-click tracking. Chromium does NOT derive click counts for
+  // windowless browsers — whatever the embedder passes to SendMouseClickEvent
+  // is what Blink uses, and `dblclick` is only synthesized at count 2. Without
+  // this every click is a fresh single click, so double-click zoom (Mapbox
+  // `doubleClickZoom`), double-click word select and triple-click line select
+  // are all structurally impossible.
+  static const Duration _multiClickInterval = Duration(milliseconds: 500);
+  static const double _multiClickSlop = 4;
+  int _clickCount = 1;
+  int? _lastClickButton;
+  Offset? _lastClickPosition;
+  DateTime? _lastClickTime;
+
+  int _nextClickCount(Offset position, int button) {
+    final now = DateTime.now();
+    final last = _lastClickTime;
+    final lastPosition = _lastClickPosition;
+    final isRepeat = last != null &&
+        lastPosition != null &&
+        button == _lastClickButton &&
+        now.difference(last) <= _multiClickInterval &&
+        (position - lastPosition).distance <= _multiClickSlop;
+    // Chromium caps at triple-click; a fourth starts over.
+    _clickCount = isRepeat && _clickCount < 3 ? _clickCount + 1 : 1;
+    _lastClickButton = button;
+    _lastClickPosition = position;
+    _lastClickTime = now;
+    return _clickCount;
+  }
+
+  // Trackpad pinch state. `PointerPanZoomUpdateEvent.scale` is cumulative from
+  // the gesture start, so each update is turned into a ratio against the
+  // previous one.
+  double _panZoomScale = 1.0;
+  double _pinchRemainder = 0;
+
+  /// Forwards one trackpad pan/zoom update.
+  ///
+  /// Pan becomes a plain wheel event. Pinch becomes a wheel event carrying
+  /// [eventFlagControlDown] — that is Chromium's own encoding of a magnify
+  /// gesture, and the only shape CEF's windowless input API can express (there
+  /// is no `SendGestureEvent`). Rotation has no wheel encoding at all and is
+  /// dropped; two-finger rotate stays unavailable on a trackpad.
+  void _onPanZoomUpdate(PointerPanZoomUpdateEvent event) {
+    if (event.panDelta != Offset.zero) {
+      _controller._setScrollDelta(event.localPosition, event.panDelta.dx,
+          event.panDelta.dy, _keyboardModifiers());
+    }
+
+    final previous = _panZoomScale;
+    final scale = event.scale;
+    _panZoomScale = scale;
+    if (previous <= 0 || scale <= 0 || scale == previous) return;
+
+    // A percentage-change delta, the same units a wheel-driven zoom uses.
+    // The native side rounds to int, so the sub-unit rest is carried over
+    // instead of being lost — a slow pinch would otherwise never move.
+    final delta = (scale / previous - 1) * 100 + _pinchRemainder;
+    final whole = delta.truncateToDouble();
+    _pinchRemainder = delta - whole;
+    if (whole == 0) return;
+    _controller._setScrollDelta(event.localPosition, 0, whole,
+        _keyboardModifiers() | eventFlagControlDown);
+  }
 
   @override
   updateEditingValueWithDeltas(List<TextEditingDelta> textEditingDeltas) {
@@ -396,26 +591,17 @@ class WebViewState extends State<WebView> with WebeViewTextInput {
     };
 
     _controller._onCursorChanged = (int type) {
-      switch (type) {
-        case 0:
-          _mouseType = SystemMouseCursors.basic;
-          break;
-        case 1:
-          _mouseType = SystemMouseCursors.precise;
-          break;
-        case 2:
-          _mouseType = SystemMouseCursors.click;
-          break;
-        case 3:
-          _mouseType = SystemMouseCursors.text;
-          break;
-        case 4:
-          _mouseType = SystemMouseCursors.wait;
-          break;
-        default:
-          _mouseType = SystemMouseCursors.basic;
-          break;
-      }
+      final cursor = switch (type) {
+        1 => SystemMouseCursors.precise,
+        2 => SystemMouseCursors.click,
+        3 => SystemMouseCursors.text,
+        4 => SystemMouseCursors.wait,
+        _ => SystemMouseCursors.basic,
+      };
+      // Hover-heavy pages fire cursor changes rapidly; don't rebuild the whole
+      // webview subtree unless the cursor actually changed.
+      if (cursor == _mouseType) return;
+      _mouseType = cursor;
       setState(() {});
     };
 
@@ -570,10 +756,13 @@ class WebViewState extends State<WebView> with WebeViewTextInput {
       child: SizeChangedLayoutNotifier(
         child: Listener(
           onPointerHover: (ev) {
-            _controller._cursorMove(ev.localPosition);
+            _controller._cursorMove(ev.localPosition,
+                _keyboardModifiers() | _buttonModifiers(ev.buttons));
             _tooltip?.cursorOffset = ev.position;
           },
           onPointerDown: (ev) {
+            // Focus grab applies to every pointer kind — keyboard/IME routing
+            // depends on it.
             if (!_focusNode.hasFocus) {
               _controller._onImeCompositionRangeChangedMessage?.call(0, 0, 0);
               _focusNode.requestFocus();
@@ -583,23 +772,80 @@ class WebViewState extends State<WebView> with WebeViewTextInput {
                 }
               });
             }
-            _controller._cursorClickDown(ev.localPosition);
+            if (ev.kind == PointerDeviceKind.touch) {
+              _controller._sendTouchEvent(_acquireTouchSlot(ev.pointer), 0,
+                  ev.localPosition, _touchPressure(ev));
+            } else {
+              final button = _mouseButtonOf(ev.buttons);
+              _pressedButtons[ev.pointer] = button;
+              _controller._cursorClickDown(
+                  ev.localPosition,
+                  _keyboardModifiers() | _buttonModifiers(ev.buttons),
+                  button,
+                  _nextClickCount(ev.localPosition, button));
+            }
           },
           onPointerUp: (ev) {
-            _controller._cursorClickUp(ev.localPosition);
+            if (ev.kind == PointerDeviceKind.touch) {
+              final slot = _touchSlots.remove(ev.pointer);
+              if (slot != null) {
+                _controller._sendTouchEvent(
+                    slot, 2, ev.localPosition, _touchPressure(ev));
+              }
+            } else {
+              // `ev.buttons` is already 0 on release, so the button comes from
+              // the matching press; the click count must match the press too or
+              // Blink won't pair them into a click.
+              final button =
+                  _pressedButtons.remove(ev.pointer) ?? mouseButtonLeft;
+              _controller._cursorClickUp(
+                  ev.localPosition, _keyboardModifiers(), button, _clickCount);
+            }
+          },
+          onPointerCancel: (ev) {
+            // Without the CANCELLED event a stuck contact wedges Chromium's
+            // gesture recognizer. Non-touch cancels have no mouse-path
+            // equivalent (CEF can't cancel a press), so they only release the
+            // button bookkeeping.
+            if (ev.kind == PointerDeviceKind.touch) {
+              final slot = _touchSlots.remove(ev.pointer);
+              if (slot != null) {
+                _controller._sendTouchEvent(
+                    slot, 3, ev.localPosition, _touchPressure(ev));
+              }
+            } else {
+              _pressedButtons.remove(ev.pointer);
+            }
           },
           onPointerMove: (ev) {
-            _controller._cursorDragging(ev.localPosition);
+            if (ev.kind == PointerDeviceKind.touch) {
+              final slot = _touchSlots[ev.pointer];
+              if (slot != null) {
+                _controller._sendTouchEvent(
+                    slot, 1, ev.localPosition, _touchPressure(ev));
+              }
+            } else {
+              _controller._cursorDragging(ev.localPosition,
+                  _keyboardModifiers() | _buttonModifiers(ev.buttons));
+            }
           },
           onPointerSignal: (signal) {
             if (signal is PointerScrollEvent) {
-              _controller._setScrollDelta(signal.localPosition,
-                  signal.scrollDelta.dx.round(), signal.scrollDelta.dy.round());
+              _controller._setScrollDelta(
+                  signal.localPosition,
+                  signal.scrollDelta.dx,
+                  signal.scrollDelta.dy,
+                  _keyboardModifiers());
             }
           },
-          onPointerPanZoomUpdate: (event) {
-            _controller._setScrollDelta(event.localPosition,
-                event.panDelta.dx.round(), event.panDelta.dy.round());
+          onPointerPanZoomStart: (event) {
+            _panZoomScale = 1.0;
+            _pinchRemainder = 0;
+          },
+          onPointerPanZoomUpdate: _onPanZoomUpdate,
+          onPointerPanZoomEnd: (event) {
+            _panZoomScale = 1.0;
+            _pinchRemainder = 0;
           },
           child: MouseRegion(
             cursor: _mouseType,

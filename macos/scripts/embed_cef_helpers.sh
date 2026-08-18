@@ -26,6 +26,21 @@ DEST="${TARGET_BUILD_DIR}/${FRAMEWORKS_FOLDER_PATH}"
 IDENTITY="${EXPANDED_CODE_SIGN_IDENTITY:--}"
 mkdir -p "${DEST}"
 
+# The helpers are nested executables the notary service checks on their own, and
+# they are not Xcode targets, so the host app's ENABLE_HARDENED_RUNTIME never
+# reaches them: enable the hardened runtime and request a secure timestamp here,
+# or notarization rejects every one of them. An ad-hoc signature ("-", what a
+# local debug build gets) can carry neither, so it keeps the old flags.
+SIGN_FLAGS=(--force --sign "${IDENTITY}")
+if [ "${IDENTITY}" = "-" ]; then
+  SIGN_FLAGS+=(--timestamp=none)
+else
+  SIGN_FLAGS+=(--options runtime --timestamp)
+fi
+if [ -f "${ENT}" ]; then
+  SIGN_FLAGS+=(--entitlements "${ENT}")
+fi
+
 # "<name suffix>:<bundle-id suffix>" — see CEF_HELPER_APP_SUFFIXES.
 for spec in ":" " (GPU):.gpu" " (Plugin):.plugin" " (Renderer):.renderer" " (Alerts):.alerts"; do
   suffix="${spec%%:*}"
@@ -58,10 +73,6 @@ for spec in ":" " (GPU):.gpu" " (Plugin):.plugin" " (Renderer):.renderer" " (Ale
 </plist>
 PLIST
 
-  if [ -f "${ENT}" ]; then
-    /usr/bin/codesign --force --sign "${IDENTITY}" --entitlements "${ENT}" --timestamp=none "${app}"
-  else
-    /usr/bin/codesign --force --sign "${IDENTITY}" --timestamp=none "${app}"
-  fi
+  /usr/bin/codesign "${SIGN_FLAGS[@]}" "${app}"
   echo "embedded ${name}.app"
 done

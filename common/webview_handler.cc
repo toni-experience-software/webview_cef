@@ -4,12 +4,14 @@
 
 #include "webview_handler.h"
 
+#include <cmath>
 #include <sstream>
 #include <string>
 #include <iostream>
 #include <chrono>
 #include <unordered_map>
 #include <cstdint>
+#include <vector>
 
 #include "include/base/cef_callback.h"
 #include "include/cef_app.h"
@@ -36,9 +38,23 @@ namespace stringpatch
 
 #include "webview_js_handler.h"
 
+#include <atomic>
+
 namespace {
 // The only browser that currently get focused
 CefRefPtr<CefBrowser> current_focused_browser_ = nullptr;
+
+// Browsers created and not yet fully closed (incremented in OnAfterCreated,
+// decremented in OnBeforeClose — both fire for every browser, popups and
+// DevTools included). stopCEF() waits on this before CefShutdown.
+std::atomic<int> live_browser_count_{0};
+
+// The same browsers, so shutdown can close them without a handler in hand
+// (stopCEF() is free-standing; the handlers belong to the plugin instances).
+// Only ever touched on the CEF UI thread — OnAfterCreated, OnBeforeClose and
+// closeAllBrowsersForShutdown's task — so it needs no lock, and the held
+// reference keeps each browser alive until its close completes.
+std::vector<CefRefPtr<CefBrowser>> live_browsers_;
 
 // Returns a data: URI with the specified contents.
 std::string GetDataURI(const std::string& data, const std::string& mime_type) {
@@ -146,8 +162,31 @@ bool WebviewHandler::OnConsoleMessage(CefRefPtr<CefBrowser> browser,
     return false;
 }
 
+int WebviewHandler::liveBrowserCount() {
+    return live_browser_count_.load();
+}
+
+void WebviewHandler::closeAllBrowsersForShutdown() {
+    if (!CefCurrentlyOn(TID_UI)) {
+        CefPostTask(TID_UI,
+                    base::BindOnce(&WebviewHandler::closeAllBrowsersForShutdown));
+        return;
+    }
+    // Move the list out rather than walking it in place: CloseBrowser can run
+    // OnBeforeClose synchronously (which erases from it), and it drops our
+    // references when this returns, so none survive into CefShutdown. CEF keeps
+    // its own references for the whole close sequence.
+    std::vector<CefRefPtr<CefBrowser>> browsers;
+    browsers.swap(live_browsers_);
+    for (const auto& browser : browsers) {
+        browser->GetHost()->CloseBrowser(true);
+    }
+}
+
 void WebviewHandler::OnAfterCreated(CefRefPtr<CefBrowser> browser) {
     CEF_REQUIRE_UI_THREAD();
+    live_browser_count_.fetch_add(1);
+    live_browsers_.push_back(browser);
     if (!browser->IsPopup()) {
         browser_map_.emplace(browser->GetIdentifier(), browser_info());
         browser_map_[browser->GetIdentifier()].browser = browser;
@@ -163,6 +202,13 @@ bool WebviewHandler::DoClose(CefRefPtr<CefBrowser> browser) {
 
 void WebviewHandler::OnBeforeClose(CefRefPtr<CefBrowser> browser) {
     CEF_REQUIRE_UI_THREAD();
+    live_browser_count_.fetch_sub(1);
+    for (auto it = live_browsers_.begin(); it != live_browsers_.end(); ++it) {
+        if ((*it)->IsSame(browser)) {
+            live_browsers_.erase(it);
+            break;
+        }
+    }
 }
 
 bool WebviewHandler::OnBeforePopup(CefRefPtr<CefBrowser> browser,
@@ -319,25 +365,53 @@ void WebviewHandler::sendExternalBeginFrame() {
 #endif
 }
 
-void WebviewHandler::sendScrollEvent(int browserId, int x, int y, int deltaX, int deltaY) {
+void WebviewHandler::sendScrollEvent(int browserId, int x, int y, double deltaX, double deltaY,
+                                     uint32_t modifiers) {
 
     auto it = browser_map_.find(browserId);
     if (it != browser_map_.end()) {
         CefMouseEvent ev;
         ev.x = x;
         ev.y = y;
+        ev.modifiers = modifiers;
 
 #ifndef __APPLE__
-        // The scrolling direction on Windows and Linux is different from MacOS
-        deltaY = -deltaY;
-        // Flutter scrolls too slowly, it looks more normal by 10x default speed.
-        it->second.browser->GetHost()->SendMouseWheelEvent(ev, deltaX * 10, deltaY * 10);
-#else
-        it->second.browser->GetHost()->SendMouseWheelEvent(ev, deltaX, deltaY);
+        // The scrolling direction on Windows and Linux is different from MacOS.
+        // Deltas are forwarded 1:1 (matching WebView2/Chrome feel) — the
+        // upstream 10x boost made canvas/map zoom wildly over-sensitive.
+        //
+        // A zoom gesture is exempt: it is not a Flutter scroll delta whose sign
+        // convention differs per platform, it is a magnitude the Dart layer
+        // synthesizes itself (pinch) or a deliberate ctrl+wheel. Negating it
+        // would invert pinch-to-zoom on Windows/Linux only.
+        if ((modifiers & EVENTFLAG_CONTROL_DOWN) == 0) {
+            deltaY = -deltaY;
+        }
 #endif
-
-
+        it->second.browser->GetHost()->SendMouseWheelEvent(
+            ev, (int)std::lround(deltaX), (int)std::lround(deltaY));
     }
+}
+
+void WebviewHandler::sendTouchEvent(int browserId, int id, int phase, double x, double y, double pressure) {
+    auto it = browser_map_.find(browserId);
+    if (it == browser_map_.end()) {
+        return;
+    }
+    CefTouchEvent ev;
+    ev.id = id;
+    ev.x = (float)x;
+    ev.y = (float)y;
+    switch (phase) {
+        case 0: ev.type = CEF_TET_PRESSED; break;
+        case 1: ev.type = CEF_TET_MOVED; break;
+        case 2: ev.type = CEF_TET_RELEASED; break;
+        case 3: ev.type = CEF_TET_CANCELLED; break;
+        default: return;
+    }
+    ev.pointer_type = CEF_POINTER_TYPE_TOUCH;
+    ev.pressure = pressure > 0.0 ? (float)pressure : 1.0f;
+    it->second.browser->GetHost()->SendTouchEvent(ev);
 }
 
 void WebviewHandler::changeSize(int browserId, float a_dpi, int w, int h)
@@ -351,33 +425,52 @@ void WebviewHandler::changeSize(int browserId, float a_dpi, int w, int h)
     }
 }
 
-void WebviewHandler::cursorClick(int browserId, int x, int y, bool up)
+namespace {
+// Guards against a malformed |button| from the channel; CEF has no "unknown".
+CefBrowserHost::MouseButtonType ToCefButton(int button) {
+    switch (button) {
+        case 1: return CefBrowserHost::MouseButtonType::MBT_MIDDLE;
+        case 2: return CefBrowserHost::MouseButtonType::MBT_RIGHT;
+        default: return CefBrowserHost::MouseButtonType::MBT_LEFT;
+    }
+}
+}  // namespace
+
+void WebviewHandler::cursorClick(int browserId, int x, int y, bool up, int button,
+                                 int clickCount, uint32_t modifiers)
 {
     auto it = browser_map_.find(browserId);
     if (it != browser_map_.end()) {
         CefMouseEvent ev;
         ev.x = x;
         ev.y = y;
-        ev.modifiers = EVENTFLAG_LEFT_MOUSE_BUTTON;
+        ev.modifiers = modifiers;
         if(up && it->second.is_dragging) {
             it->second.browser->GetHost()->DragTargetDrop(ev);
             it->second.browser->GetHost()->DragSourceSystemDragEnded();
             it->second.is_dragging = false;
         } else {
-            it->second.browser->GetHost()->SendMouseClickEvent(ev, CefBrowserHost::MouseButtonType::MBT_LEFT, up, 1);
+            it->second.browser->GetHost()->SendMouseClickEvent(
+                ev, ToCefButton(button), up, clickCount < 1 ? 1 : clickCount);
         }
     }
 }
 
-void WebviewHandler::cursorMove(int browserId, int x , int y, bool dragging)
+void WebviewHandler::cursorMove(int browserId, int x , int y, bool dragging, uint32_t modifiers)
 {
     auto it = browser_map_.find(browserId);
     if (it != browser_map_.end()) {
         CefMouseEvent ev;
         ev.x = x;
         ev.y = y;
-        if(dragging) {
-            ev.modifiers = EVENTFLAG_LEFT_MOUSE_BUTTON;
+        // The held buttons ride in |modifiers|; |dragging| only selects the
+        // drag-and-drop path below. Older callers that pass no button flags
+        // still get a left-button drag so behaviour doesn't regress.
+        ev.modifiers = modifiers;
+        if(dragging && (modifiers & (EVENTFLAG_LEFT_MOUSE_BUTTON |
+                                     EVENTFLAG_MIDDLE_MOUSE_BUTTON |
+                                     EVENTFLAG_RIGHT_MOUSE_BUTTON)) == 0) {
+            ev.modifiers |= EVENTFLAG_LEFT_MOUSE_BUTTON;
         }
         if(it->second.is_dragging && dragging) {
             it->second.browser->GetHost()->DragTargetDragOver(ev, DRAG_OPERATION_EVERY);
