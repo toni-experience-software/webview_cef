@@ -9,6 +9,7 @@
 #endif
 
 #include <math.h>
+#include <atomic>
 #include <chrono>
 #include <memory>
 #include <thread>
@@ -29,8 +30,10 @@ namespace webview_cef {
 	CefString userAgent;
 	bool isCefInitialized = false;
 	// Whether CefInitialize actually succeeded this session — CefShutdown
-	// without a successful init crashes, so stopCEF() gates on it.
-	static bool g_cefInitOk = false;
+	// without a successful init crashes, so stopCEF() gates on it. Atomic
+	// because the Windows vsync driver reads it off the platform thread (see
+	// tickBeginFrame).
+	static std::atomic<bool> g_cefInitOk{false};
 #ifdef _WIN32
 	// The persistent profile dir (empty when running cache-less). Used by the
 	// clean-exit marker below.
@@ -801,7 +804,17 @@ namespace webview_cef {
 	}
 
 	void WebviewPlugin::tickBeginFrame(){
-		if (m_handler) {
+		// The Windows vsync driver starts at plugin *registration*, which
+		// happens for every host that merely links this plugin — long before
+		// (and possibly without ever) booting CEF. sendExternalBeginFrame ends
+		// in CefPostTask, and posting a task before CefInitialize/
+		// CefExecuteProcess has configured the API version is fatal inside
+		// libcef: cef_api_hash() is only called from those two entry points, so
+		// cef_api_version() is still -1 and the CToCpp wrapper aborts with
+		// "CefTask_0_CToCpp called with invalid version -1" — an int 3 that the
+		// host sees as an 0x80000003 crash in libcef.dll at startup. Nothing to
+		// begin-frame before CEF is up anyway, so tick only once it is.
+		if (g_cefInitOk && m_handler) {
 			m_handler->sendExternalBeginFrame();
 		}
 	}
