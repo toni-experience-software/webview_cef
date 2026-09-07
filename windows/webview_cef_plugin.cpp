@@ -1,5 +1,8 @@
 ﻿#include "webview_cef_plugin.h"
 #include "webview_cef_keyevent.h"
+// WebviewHandler::liveBrowserCount() — the frame pump runs only while a browser
+// is actually alive (see VsyncThreadProc).
+#include "webview_handler.h"
 #ifdef WEBVIEW_CEF_GPU_TEXTURE
 #include "webview_cef_gpu_texture.h"
 #endif
@@ -16,6 +19,7 @@
 #include <flutter/plugin_registrar_windows.h>
 #include <flutter/standard_method_codec.h>
 
+#include <algorithm>
 #include <memory>
 #include <thread>
 #include <iostream>
@@ -243,28 +247,85 @@ namespace webview_cef {
 		return 16;  // assume ~60 Hz
 	}
 
+	// With no live browser there is nothing to pace, so the pump neither waits on
+	// vblank nor holds a DXGI object — it just polls this slowly. Every Flutter
+	// host that *links* this plugin starts the pump at registration, including
+	// hosts that pull it in transitively and never open a webview, so the idle
+	// state is the common one and it has to be close to free. 200ms is ~2% of the
+	// wakeups a 120Hz vblank wait costs, and is well inside the latency of
+	// creating the first browser.
+	static constexpr UINT kIdlePollMs = 200;
+
+	// WaitForVBlank returns S_OK *immediately* — not an error — when the monitor
+	// is asleep, the desktop is occluded, or the DXGI factory has gone stale (a
+	// remote-desktop session detach does it). Without a floor on how long the
+	// wait actually took, the loop becomes a 100%-of-one-core spin that floods
+	// CEF with begin-frame tasks. On a display that blanks on idle that is the
+	// normal state, not an edge case. Chromium guards the same call the same way
+	// (ui/gl/vsync_thread_win.cc), with the same 1ms threshold.
+	static constexpr auto kMinVBlankWait = std::chrono::milliseconds(1);
+
+	static void TickAllPlugins() {
+		std::vector<std::shared_ptr<WebviewPlugin>> snapshot;
+		{
+			std::lock_guard<std::mutex> lock(g_pluginsMutex);
+			snapshot.reserve(webviewPlugins.size());
+			for (auto& kv : webviewPlugins) snapshot.push_back(kv.second);
+		}
+		for (auto& p : snapshot) {
+			if (p) p->tickBeginFrame();
+		}
+	}
+
 	static void VsyncThreadProc() {
-		Microsoft::WRL::ComPtr<IDXGIOutput> output = AcquirePrimaryDxgiOutput();
-		const UINT fallbackMs = QueryRefreshIntervalMs();
+		Microsoft::WRL::ComPtr<IDXGIOutput> output;
+		UINT frameMs = 16;
+		UINT acquireBackoffMs = 0;
 		while (g_vsyncRunning) {
-			if (output) {
-				if (FAILED(output->WaitForVBlank())) {
-					output.Reset();
-				}
+			if (WebviewHandler::liveBrowserCount() == 0) {
+				// Drop the output as well as the wait: holding one across a
+				// display topology change is exactly what leaves the factory
+				// stale, and re-acquiring on wake costs nothing at this rate.
+				output.Reset();
+				acquireBackoffMs = 0;
+				std::this_thread::sleep_for(std::chrono::milliseconds(kIdlePollMs));
+				continue;
 			}
+
 			if (!output) {
-				std::this_thread::sleep_for(std::chrono::milliseconds(fallbackMs));
 				output = AcquirePrimaryDxgiOutput();
+				// Re-read the refresh rate with the output: it is the one point
+				// where a mode or topology change is visible to this thread.
+				frameMs = QueryRefreshIntervalMs();
+				if (!output) {
+					// No output to wait on: headless, a WARP/Basic-Render
+					// adapter (which has none by design), or some RDP sessions.
+					// Back off instead of re-enumerating DXGI at frame rate
+					// forever, but keep ticking — a timer-paced frame beats no
+					// frame at all.
+					acquireBackoffMs = acquireBackoffMs
+						? (std::min)(acquireBackoffMs * 2, 1000u)
+						: frameMs;
+					std::this_thread::sleep_for(std::chrono::milliseconds(acquireBackoffMs));
+					TickAllPlugins();
+					continue;
+				}
+				acquireBackoffMs = 0;
 			}
-			std::vector<std::shared_ptr<WebviewPlugin>> snapshot;
-			{
-				std::lock_guard<std::mutex> lock(g_pluginsMutex);
-				snapshot.reserve(webviewPlugins.size());
-				for (auto& kv : webviewPlugins) snapshot.push_back(kv.second);
+
+			const auto waitStart = std::chrono::steady_clock::now();
+			bool paced = false;
+			if (SUCCEEDED(output->WaitForVBlank())) {
+				paced = (std::chrono::steady_clock::now() - waitStart) >= kMinVBlankWait;
+			} else {
+				output.Reset();
 			}
-			for (auto& p : snapshot) {
-				if (p) p->tickBeginFrame();
+			if (!paced) {
+				// The wait either failed or returned early (see kMinVBlankWait).
+				// Pace off the clock so we neither spin nor stop producing.
+				std::this_thread::sleep_for(std::chrono::milliseconds(frameMs));
 			}
+			TickAllPlugins();
 		}
 	}
 
@@ -334,7 +395,13 @@ namespace webview_cef {
 		}
 		case WM_IME_ENDCOMPOSITION: {
 			auto pit = webviewPlugins.find(hwnd);
-			if (pit != webviewPlugins.end()) {
+			// Same guard as WM_IME_COMPOSITION above, and for a second reason:
+			// the subclass is installed for every host that links the plugin, so
+			// without it an IME composition ending over the Flutter window
+			// reaches CefPostTask before CEF exists — the pre-init fatal that
+			// tickBeginFrame documents. isEditableFocused() reads only local
+			// renderer state, so it is safe to call before CEF is up.
+			if (pit != webviewPlugins.end() && pit->second->isEditableFocused()) {
 				pit->second->imeFinishCompositionNative();
 			}
 			return DefSubclassProc(hwnd, message, wparam, lparam);
