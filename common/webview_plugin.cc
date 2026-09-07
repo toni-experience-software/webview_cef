@@ -28,6 +28,9 @@ namespace webview_cef {
 	CefMainArgs mainArgs;
 	CefRefPtr<WebviewApp> app;
 	CefString userAgent;
+	// Whether startCEF() has already run. "Attempted", not "succeeded": CEF
+	// cannot be initialized twice in a process, so a failed start must not be
+	// retried either. Set by startCEF(), which is the only caller that matters.
 	bool isCefInitialized = false;
 	// Whether CefInitialize actually succeeded this session — CefShutdown
 	// without a successful init crashes, so stopCEF() gates on it. Atomic
@@ -917,6 +920,17 @@ namespace webview_cef {
 
 	void startCEF()
 	{
+		// Once-only. The "init" method call already checks isCefInitialized, but
+		// nothing used to set it, so a second init re-entered here and called
+		// CefInitialize on a live context. That returns false, which used to be
+		// a stray warning and is now load-bearing: g_cefInitOk would flip to
+		// false while CEF was still running, permanently stopping the frame pump
+		// (see tickBeginFrame) and making stopCEF() skip CefShutdown.
+		if (isCefInitialized) {
+			return;
+		}
+		isCefInitialized = true;
+
 		CefSettings cefs;
 		cefs.windowless_rendering_enabled = true;
 		cefs.no_sandbox = true;
@@ -1041,6 +1055,13 @@ namespace webview_cef {
 		// the full timeout and then force-shut-down in exactly the state the
 		// wait exists to prevent. Requesting the closes here covers every
 		// entry point into shutdown.
+		// Close the frame pump's gate first. Everything below — the bounded
+		// wait for browsers to drain, then CefShutdown itself — runs with the
+		// vsync thread still live, and a begin-frame posted into a CEF that is
+		// shutting down is the same fatal as posting into one that never
+		// started. Clearing the flag after CefShutdown (where it used to be)
+		// left that whole window open, up to the full 2s timeout.
+		g_cefInitOk = false;
 		WebviewHandler::closeAllBrowsersForShutdown();
 		// Browser closes are async (CloseBrowser is issued on CEF's UI thread,
 		// and the browser is only gone once OnBeforeClose fires there).
@@ -1075,7 +1096,6 @@ namespace webview_cef {
 			fflush(stderr);
 		}
 		CefShutdown();
-		g_cefInitOk = false;
 #ifdef _WIN32
 		// Mark this run as cleanly shut down (see kCleanExitMarker) — but only
 		// when the browsers really drained. A forced CefShutdown is the very
