@@ -32,7 +32,7 @@
 
 ## 环境要求
 
-- Flutter **>= 3.27.0**、Dart **>= 3.6.0**（已在最新稳定版 Flutter 3.44.x 上测试）。
+- Flutter **>= 3.44.0**、Dart **>= 3.6.0**（已在最新稳定版 Flutter 3.44.x 上测试）。
 - 原生侧需要 C++20 工具链（CEF 149 要求）—— 较新的 MSVC / Clang / GCC。
 
 ---
@@ -41,10 +41,10 @@
 
 0.5.0 是一次大版本升级（Flutter 3.44 + CEF 149），在所有平台上都有破坏性变更。若你从旧版本升级，请按以下步骤操作：
 
-- **工具链** —— 升级到 Flutter **≥ 3.27.0** / Dart **≥ 3.6.0**（原为 2.5.0 / 2.17.1）。原生构建现在需要 **C++20**（CEF 149）；请确保你的工程没有把插件 target 强制设为更低的 C++ 标准。
+- **工具链** —— 升级到 Flutter **≥ 3.44.0** / Dart **≥ 3.6.0**（原为 2.5.0 / 2.17.1）。原生构建现在需要 **C++20**（CEF 149）；请确保你的工程没有把插件 target 强制设为更低的 C++ 标准。
 - **移除的 Dart API** —— `WebviewCefPlatform`、`MethodChannelWebviewCef`、`getPlatformVersion()` 已移除（同时移除了 `plugin_platform_interface` 依赖）。它们本就不是对外 API，且无替代（`getPlatformVersion` 仅返回演示值）。请只 import `package:webview_cef/webview_cef.dart`，使用 `WebviewManager` / `WebViewController`。
 - **Windows** —— `initCEFProcesses` 签名变更。请更新 `windows/runner/main.cpp`：它现在接收 `HINSTANCE` 并返回子进程退出码，且必须作为 `wWinMain` 的第一条语句立即返回（见下方 Windows 安装片段）。最低系统现为 **Windows 10**。
-- **macOS** —— 把部署目标提升到 **12.0**：在 `macos/Podfile` 设置 `platform :osx, '12.0'`，并在 Xcode 中把 Runner target 的 macOS Deployment Target 也设为 12.0（CEF 149 的 framework 以 12.0 构建）。要启用多进程渲染，请在 `macos/Podfile` 的 `post_install` 中加入一行钩子（见 macOS 安装一节）。构建现在**仅针对本机架构**（arm64 *或* x86_64）—— 不再生成 Universal 包。
+- **macOS** —— 使用 Flutter **3.44+** 和 SwiftPM，部署目标为 **12.0+**；运行 CEF 准备命令并添加 Runner 嵌入阶段，详见下文。仅支持本机架构。
 
 ---
 
@@ -90,37 +90,42 @@
 
 ### macOS
 
-> **要求 macOS 12.0 及以上** —— CEF 149 的 framework 以 12.0 为部署目标,所以你 App 的 macOS 部署目标必须 **≥ 12.0**(在 `macos/Podfile` 设 `platform :osx, '12.0'`,并同步 Runner target)。更低的版本无法干净链接。
+要求 **Flutter 3.44+**、**macOS 12.0+**、Xcode 和 `cmake`（`brew install cmake ninja`；没有 Ninja 时使用 make）。macOS **仅支持 Swift Package Manager**。
 
-1. 添加依赖：
+1. 在 Flutter App 目录执行：
 
    ```bash
    flutter pub add webview_cef
+   dart run webview_cef:setup_macos
    ```
 
-2. 启用多进程(推荐):在 `macos/Podfile` 已有的 `post_install` 里加上 helper 钩子:
+   本仓库的 `example/` 已声明依赖，只需先运行 `flutter pub get`。准备命令从 <https://cef-builds.spotifycdn.com> 下载官方 CEF，编译 Debug 和 Release 两套 wrapper/helper，并生成 `macos/Flutter/webview_cef.xcconfig`。二进制保存在插件的 `macos/third/cef`，不提交到 Git；版本和配置未变时重复执行会跳过编译。
 
-   ```ruby
-   post_install do |installer|
-     installer.pods_project.targets.each do |target|
-       flutter_additional_macos_build_settings(target)
-     end
-     # webview_cef: 嵌入 CEF helper 子进程 app(多进程)。
-     require File.expand_path(
-       'Flutter/ephemeral/.symlinks/plugins/webview_cef/macos/embed_cef_helpers.rb', __dir__)
-     WebviewCEF.install_helper_phase(installer)
-   end
+2. 在 `macos/Runner/Configs/Debug.xcconfig` 和 `Release.xcconfig` 中都加入（Profile 通常使用 Release）：
+
+   ```text
+   #include "../../Flutter/webview_cef.xcconfig"
    ```
 
-   然后 `pod install`(`flutter run` 会自动跑)。它会装一个 "Embed CEF Helpers" 构建阶段,把预编译的 helper 克隆成 5 个 CEF 子进程 `.app` 嵌进你的 App —— 无需手动加 Xcode target。**不加这个钩子插件也能用,但会回退单进程**(Chromium 不支持的模式:无崩溃隔离、V8 proxy resolver 被禁等)。
+   与示例一致，宿主 App 不启用 macOS App Sandbox：从 `Runner/DebugProfile.entitlements` 和 `Runner/Release.entitlements` 移除 `com.apple.security.app-sandbox`。
 
-macOS 走 CocoaPods，不跑 CMake 的下载流程。改由 podspec 的 `prepare_command` 在 `pod install` 时运行 [`macos/scripts/download_cef.sh`](macos/scripts/download_cef.sh)，逻辑与 Windows/Linux 对齐：下载与本机架构匹配的官方 CEF *Standard Distribution*（来自 <https://cef-builds.spotifycdn.com>，版本由 [`third/download.cmake`](third/download.cmake) 的 `CEF_VERSION` 固定），从源码编译 `libcef_dll_wrapper`，把 framework 整理成 versioned macOS bundle，并安装进（已 git-ignore 的）`macos/third/cef`。所以首次 `pod install` 会明显变慢；之后只要版本未变即为 no-op。
+   生成的配置指定本机架构（arm64 或 x86_64）、macOS 12.0，并关闭构建脚本沙箱。移除 target 中冲突的设置；如需更高的部署目标，在 include 之后设置。不支持 Universal 构建。
 
-要求：`PATH` 上需有 `cmake`（以及 `ninja`，否则退回 `make`）来编译 wrapper —— `brew install cmake ninja`。
+3. 在 Xcode 的 Runner 中，现有 Flutter 嵌入阶段之后添加名为 **Embed CEF** 的 Run Script 阶段：
 
-> wrapper 默认编 `Debug`，以匹配 `flutter run` / `flutter build macos --debug`。如需 release 构建，在 `pod install` 前设置 `CEF_WRAPPER_BUILD_TYPE=Release`（debug 与 release 需要对应配置编译的 wrapper —— `#if DCHECK_IS_ON()` 会改变其 ABI）。
+   ```bash
+   bash "${WEBVIEW_CEF_MACOS_DIR}/scripts/embed_cef_helpers.sh"
+   ```
 
-> 脚本只为本机架构编译（arm64 **或** x86_64）。如需 Universal（arm64 + x86_64）App，用 `lipo` 合并 wrapper 并使用 universal framework，详见 [#30](/../../issues/30)。**`[征集帮助]`** 更优雅的二进制分发方式。
+   取消勾选 **Based on dependency analysis**。脚本会嵌入 CEF framework 和五个 helper App，并按顺序签名内部动态库及 bundle。缺失、过期或架构不符时会报错并提示重新准备。Debug 使用 Debug wrapper/helper；Profile 和 Release 使用 Release，切换配置无需重新准备。
+
+4. 执行 `flutter run -d macos` 或 `flutter build macos`，Flutter 会生成 SwiftPM 集成。若之前全局禁用了 SwiftPM，执行 `flutter config --enable-swift-package-manager`。
+
+将 `macos/Flutter/webview_cef.xcconfig` 加入 App 的 `.gitignore`，因为它包含本机插件路径。每台开发机/CI 机器均需运行准备命令；插件位置、本机架构或 CEF 版本变化后也需重跑。示例项目已配置 include 和构建阶段。
+
+**从 CocoaPods 迁移：**移除旧的 `WebviewCEF.install_helper_phase` Podfile 钩子和 `Embed CEF Helpers` 阶段。所有依赖均支持 SwiftPM 时，可用 `pod deintegrate` 移除 CocoaPods 集成，再删除 Podfile/lockfile、workspace 中的 Pods 引用及 Pods xcconfig include。若其他插件仍依赖 CocoaPods，可保留它们的集成；本插件不再提供 podspec。
+
+CEF 版本仍由 [`third/download.cmake`](third/download.cmake) 固定。两种构建模式都使用 CEF Release framework，但 wrapper 的 C++ ABI 与各自插件配置匹配。SwiftPM 链接本地准备的原生库，不依赖单独托管的二进制包。
 
 ### Linux
 
@@ -274,7 +279,7 @@ final controller = WebviewManager().createWebView(injectUserScripts: scripts);
 
 ## 升级 CEF
 
-CEF/Chromium 版本只在一处管理 —— [`third/download.cmake`](third/download.cmake) 里的 `CEF_VERSION`。修改它即可升级三端的 CEF：Windows 与 Linux 自动下载，macOS 也读取同一个 `CEF_VERSION`（通过 podspec `prepare_command` 运行的 [`macos/scripts/download_cef.sh`](macos/scripts/download_cef.sh)），在下次 `pod install` 时重新下载，无需手动放置。唯一的额外步骤是同步 [`.github/workflows/test_macos.yaml`](.github/workflows/test_macos.yaml) 里硬编码的 `CEF_VERSION`。
+CEF/Chromium 版本由 [`third/download.cmake`](third/download.cmake) 的 `CEF_VERSION` 管理。Windows/Linux 自动下载；macOS 修改版本后，在 App 目录重跑 `dart run webview_cef:setup_macos`。CI 使用相同脚本和版本。
 
 ---
 
@@ -300,7 +305,7 @@ CEF/Chromium 版本只在一处管理 —— [`third/download.cmake`](third/down
 - [x] 鼠标与触控板输入
 - [x] DevTools
 - [x] GPU 零拷贝渲染与自适应帧率（Windows 与 macOS）
-- [x] 更简单的 macOS 多进程 helper bundle 集成（一行 Podfile 钩子）
+- [x] macOS SwiftPM 集成、CEF 准备命令及多进程 helper 嵌入
 - [ ] macOS Universal（arm64 + x86_64）构建（需要 lipo 合并的 CEF）
 - [ ] Windows 上无撕裂的 GPU 同步（keyed-mutex）
 

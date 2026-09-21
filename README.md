@@ -33,7 +33,7 @@ A Flutter **desktop** WebView backed by [CEF](https://bitbucket.org/chromiumembe
 
 ## Requirements
 
-- Flutter **>= 3.27.0**, Dart **>= 3.6.0** (tested against the latest stable Flutter, 3.44.x).
+- Flutter **>= 3.44.0**, Dart **>= 3.6.0** (tested against the latest stable Flutter, 3.44.x).
 - A C++20 toolchain for the native side (required by CEF 149) — recent MSVC / Clang / GCC.
 
 ---
@@ -42,10 +42,10 @@ A Flutter **desktop** WebView backed by [CEF](https://bitbucket.org/chromiumembe
 
 0.5.0 is a large upgrade (Flutter 3.44 + CEF 149) with breaking changes on every platform. If you are coming from an older release, do the following:
 
-- **Toolchain** — upgrade to Flutter **≥ 3.27.0** / Dart **≥ 3.6.0** (was 2.5.0 / 2.17.1). The native build now requires **C++20** (CEF 149); make sure your app doesn't force the plugin target to an older C++ standard.
+- **Toolchain** — upgrade to Flutter **≥ 3.44.0** / Dart **≥ 3.6.0** (was 2.5.0 / 2.17.1). The native build now requires **C++20** (CEF 149); make sure your app doesn't force the plugin target to an older C++ standard.
 - **Removed Dart API** — `WebviewCefPlatform`, `MethodChannelWebviewCef`, and `getPlatformVersion()` were removed (along with the `plugin_platform_interface` dependency). They were never the intended API and have no replacement (`getPlatformVersion` returned a demo value). Import only `package:webview_cef/webview_cef.dart` and use `WebviewManager` / `WebViewController`.
 - **Windows** — `initCEFProcesses` changed signature. Update `windows/runner/main.cpp`: it now takes the `HINSTANCE` and returns a sub-process exit code that must be returned immediately, as the first statement in `wWinMain` (see the Windows install snippet below). The minimum OS is now **Windows 10**.
-- **macOS** — raise the deployment target to **12.0**: set `platform :osx, '12.0'` in `macos/Podfile` **and** the Runner target's macOS Deployment Target in Xcode (CEF 149's framework is built for 12.0). To enable multi-process rendering, add the one-line `post_install` hook to `macos/Podfile` (see the macOS install section). Builds are now **host-architecture only** (arm64 *or* x86_64) — universal macOS apps are no longer produced.
+- **macOS** — use Flutter **3.44+** and SwiftPM, set the deployment target to **12.0+**, run CEF preparation, and add the Runner embedding phase described below. Builds remain host-architecture only.
 
 ---
 
@@ -91,37 +91,42 @@ On the first build, the official CEF *Standard Distribution* (~330 MB, from <htt
 
 ### macOS
 
-> **Requires macOS 12.0 or newer** — CEF 149 ships a framework with a 12.0 deployment target, so your app's macOS deployment target must be **≥ 12.0** (set it in `macos/Podfile` (`platform :osx, '12.0'`) and the Runner target). Older targets fail to link cleanly.
+Requires **Flutter 3.44+**, **macOS 12.0+**, Xcode, and `cmake` (`brew install cmake ninja`; `make` is used if Ninja is unavailable). macOS uses **Swift Package Manager only**.
 
-1. Add the dependency:
+1. From your Flutter app directory, add the dependency and prepare CEF:
 
    ```bash
    flutter pub add webview_cef
+   dart run webview_cef:setup_macos
    ```
 
-2. Enable multi-process (recommended) by adding the helper hook to your `macos/Podfile`'s existing `post_install`:
+   In this repository's `example/`, run `flutter pub get` before the setup command instead. Preparation downloads the official CEF Standard Distribution from <https://cef-builds.spotifycdn.com>, builds both Debug and Release wrappers/helpers, and writes `macos/Flutter/webview_cef.xcconfig`. Artifacts stay in the plugin's ignored `macos/third/cef` directory. Repeating the command is a no-op when the pinned version and both configurations are present.
 
-   ```ruby
-   post_install do |installer|
-     installer.pods_project.targets.each do |target|
-       flutter_additional_macos_build_settings(target)
-     end
-     # webview_cef: embed the CEF helper sub-process apps (multi-process).
-     require File.expand_path(
-       'Flutter/ephemeral/.symlinks/plugins/webview_cef/macos/embed_cef_helpers.rb', __dir__)
-     WebviewCEF.install_helper_phase(installer)
-   end
+2. Include the generated settings in **both** `macos/Runner/Configs/Debug.xcconfig` and `Release.xcconfig` (Profile normally uses Release):
+
+   ```text
+   #include "../../Flutter/webview_cef.xcconfig"
    ```
 
-   Then `pod install` (run automatically by `flutter run`). This installs an "Embed CEF Helpers" build phase that clones the prebuilt helper into the five CEF sub-process `.app` bundles inside your app — no manual Xcode target needed. **Without this hook the plugin still works but falls back to single-process** (an unsupported Chromium mode: no crash isolation, V8 proxy resolver disabled, etc.).
+   Like the example, the host app must run without the macOS App Sandbox: remove `com.apple.security.app-sandbox` from `Runner/DebugProfile.entitlements` and `Runner/Release.entitlements`.
 
-macOS uses CocoaPods, which does not run the CMake download path. Instead the podspec's `prepare_command` runs [`macos/scripts/download_cef.sh`](macos/scripts/download_cef.sh) on `pod install`, which mirrors the Windows/Linux flow: it downloads the official CEF *Standard Distribution* for your arch (from <https://cef-builds.spotifycdn.com>, version pinned by `CEF_VERSION` in [`third/download.cmake`](third/download.cmake)), compiles `libcef_dll_wrapper` from source, lays the framework out as a versioned macOS bundle, and installs everything into the (git-ignored) `macos/third/cef`. The first `pod install` therefore takes noticeably longer; subsequent runs are a no-op once the pinned version is present.
+   These settings select the host architecture (`arm64` or `x86_64`), macOS 12.0, and disable script sandboxing for the embedding phase. Remove any conflicting target-level overrides. If your app needs a newer macOS deployment target, set it after this include. Universal builds are not supported.
 
-Requirements: `cmake` (and `ninja`, otherwise `make` is used) must be on `PATH` to build the wrapper — `brew install cmake ninja`.
+3. In Xcode, add a Runner **Run Script** phase named **Embed CEF**, after the existing Flutter embedding phase:
 
-> The wrapper is built `Debug` by default to match `flutter run` / `flutter build macos --debug`. For a release build set `CEF_WRAPPER_BUILD_TYPE=Release` before `pod install` (debug and release builds need a wrapper compiled in the matching configuration — `#if DCHECK_IS_ON()` changes its ABI).
+   ```bash
+   bash "${WEBVIEW_CEF_MACOS_DIR}/scripts/embed_cef_helpers.sh"
+   ```
 
-> The script builds for the host arch only (arm64 **or** x86_64). For a Universal (arm64 + x86_64) app, `lipo` the wrapper and use a universal framework — see [#30](/../../issues/30). **`[HELP WANTED]`** a more elegant binary distribution.
+   Uncheck **Based on dependency analysis** so it runs for every build. This copies the CEF framework and all five helper apps, signs nested libraries and bundles, and fails with a setup instruction if artifacts are missing, stale, or for another architecture. Debug uses the Debug wrapper/helper; Profile and Release use Release. No preparation is needed when switching configuration.
+
+4. Build with `flutter run -d macos` or `flutter build macos`. Flutter generates the SwiftPM integration automatically. If SwiftPM was disabled globally, enable it with `flutter config --enable-swift-package-manager`.
+
+Do not commit `macos/Flutter/webview_cef.xcconfig`: it contains a machine-local plugin path. Add it to your app's `.gitignore`. Run setup on each development/CI machine and again after changing the plugin location, host architecture, or pinned CEF version. The example already includes the Runner settings and embedding phase.
+
+**Migrating from CocoaPods:** remove the old `WebviewCEF.install_helper_phase` Podfile hook and `Embed CEF Helpers` build phase. For an app whose dependencies all support SwiftPM, remove CocoaPods integration (`pod deintegrate`), its Podfile/lockfile, Pods workspace references, and Pods xcconfig includes. Keep CocoaPods integration if unrelated plugins still require it; this plugin itself no longer provides a podspec. Replace the old setup with the steps above.
+
+CEF's version remains pinned in [`third/download.cmake`](third/download.cmake). Preparation uses CEF's Release framework for both modes while matching each wrapper's C++ ABI to the plugin configuration. SwiftPM uses local native search/linker settings; there is no separately hosted binary package.
 
 ### Linux
 
@@ -307,7 +312,7 @@ These CMake options can be set on the plugin target (defaults shown):
 
 ## Updating CEF
 
-The CEF/Chromium version is pinned in one place — `CEF_VERSION` in [`third/download.cmake`](third/download.cmake). Bump it to update CEF on all three platforms: Windows and Linux download it automatically, and macOS reads the same `CEF_VERSION` (via `macos/scripts/download_cef.sh`, run by the podspec's `prepare_command`) and re-downloads on the next `pod install` — no manual placement needed. The only extra step is keeping the hardcoded `CEF_VERSION` in [`.github/workflows/test_macos.yaml`](.github/workflows/test_macos.yaml) in sync.
+The CEF/Chromium version is pinned in [`third/download.cmake`](third/download.cmake). Windows and Linux download it automatically; on macOS, rerun `dart run webview_cef:setup_macos` from your app directory after changing the pin. CI uses the same preparation script and version.
 
 ---
 
@@ -333,7 +338,7 @@ The CEF/Chromium version is pinned in one place — `CEF_VERSION` in [`third/dow
 - [x] Mouse & trackpad input
 - [x] DevTools
 - [x] GPU zero-copy rendering & adaptive frame rate (Windows & macOS)
-- [x] Easier macOS multi-process helper-bundle integration (one-line Podfile hook)
+- [x] macOS SwiftPM integration with CEF preparation and multi-process helper embedding
 - [ ] Universal (arm64 + x86_64) macOS builds (needs a lipo'd CEF)
 - [ ] Tear-free GPU sync (keyed-mutex) on Windows
 

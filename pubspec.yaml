@@ -6,7 +6,7 @@ repository: https://github.com/hlwhl/webview_cef
 
 environment:
   sdk: ">=3.6.0 <4.0.0"
-  flutter: ">=3.27.0"
+  flutter: ">=3.44.0"
 
 dependencies:
   flutter:

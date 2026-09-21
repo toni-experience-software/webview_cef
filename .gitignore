@@ -70,3 +70,6 @@ app.*.map.json
 
 /macos/third/cef/Chromium Embedded Framework.framework
 /macos/third/cef/libcef_dll_wrapper.a
+.build/
+.swiftpm/
+**/macos/Flutter/webview_cef.xcconfig

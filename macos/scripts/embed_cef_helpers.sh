@@ -1,30 +1,50 @@
 #!/usr/bin/env bash
-#
-# Embed the CEF helper sub-process apps into the host application bundle, so CEF
-# runs multi-process on macOS. Invoked as a build phase of the host app's Runner
-# target (installed via the Podfile post_install hook in macos/embed_cef_helpers.rb).
-#
-# It clones the prebuilt helper executable (macos/third/cef/cef_helper, produced
-# by download_cef.sh) into the five CEF-named ".app" bundles inside the host
-# app's Frameworks dir, writes a minimal Info.plist for each, and code-signs them.
-#
-# If the prebuilt helper is missing, it does nothing — the plugin then falls back
-# to single-process at runtime, so the build still succeeds.
+# Embed and sign CEF and its helper apps in the host Runner build phase.
 set -euo pipefail
 
-PLUGIN_MACOS="${WEBVIEW_CEF_MACOS_DIR:-${SRCROOT}/Flutter/ephemeral/.symlinks/plugins/webview_cef/macos}"
-HELPER_BIN="${PLUGIN_MACOS}/third/cef/cef_helper"
+err() { echo "error: $* Run dart run webview_cef:setup_macos from your app directory." >&2; exit 1; }
+PLUGIN_MACOS="${WEBVIEW_CEF_MACOS_DIR:?Include Flutter/webview_cef.xcconfig; run dart run webview_cef:setup_macos}"
+CEF="${PLUGIN_MACOS}/third/cef"
+case "${CONFIGURATION}" in
+  Debug*) BUILD_TYPE=Debug ;;
+  Release*|Profile*) BUILD_TYPE=Release ;;
+  *) err "Unsupported build configuration: ${CONFIGURATION}." ;;
+esac
+HELPER_BIN="${CEF}/${BUILD_TYPE}/cef_helper"
 ENT="${PLUGIN_MACOS}/helper/Helper.entitlements"
-
-if [ ! -f "${HELPER_BIN}" ]; then
-  echo "warning: webview_cef helper not found at ${HELPER_BIN}; skipping embed (CEF will run single-process)."
-  exit 0
-fi
+FRAMEWORK="Chromium Embedded Framework.framework"
+[ -f "${HELPER_BIN}" ] || err "Missing ${BUILD_TYPE} CEF helper."
+[ -f "${CEF}/${BUILD_TYPE}/libcef_dll_wrapper.a" ] || err "Missing ${BUILD_TYPE} CEF wrapper."
+[ -f "${CEF}/${FRAMEWORK}/Chromium Embedded Framework" ] || err "Missing CEF framework."
+CEF_VERSION="$(sed -n 's/^[[:space:]]*set(CEF_VERSION[[:space:]]*"\(.*\)").*/\1/p' "${PLUGIN_MACOS}/../third/download.cmake" | head -1)"
+case "${ARCHS}" in
+  arm64) CEF_ARCH=macosarm64 ;;
+  x86_64) CEF_ARCH=macosx64 ;;
+  *) err "CEF requires a single architecture, got ARCHS=${ARCHS}." ;;
+esac
+[ -f "${CEF}/version.txt" ] && [ "$(cat "${CEF}/version.txt")" = "${CEF_VERSION}_${CEF_ARCH}_swiftpm_v1" ] || err "CEF artifacts are stale or for another architecture."
+for binary in "${HELPER_BIN}" "${CEF}/${FRAMEWORK}/Chromium Embedded Framework" "${CEF}/${BUILD_TYPE}/libcef_dll_wrapper.a"; do
+  lipo "${binary}" -verify_arch "${ARCHS}" || err "CEF architecture mismatch: ${binary}."
+done
 
 BASE="${EXECUTABLE_NAME} Helper"
 DEST="${TARGET_BUILD_DIR}/${FRAMEWORKS_FOLDER_PATH}"
 IDENTITY="${EXPANDED_CODE_SIGN_IDENTITY:--}"
+SIGN_FLAGS=(--force --sign "${IDENTITY}")
+if [ "${IDENTITY}" = - ]; then
+  SIGN_FLAGS+=(--timestamp=none)
+else
+  SIGN_FLAGS+=(--options runtime --timestamp)
+fi
 mkdir -p "${DEST}"
+rm -rf "${DEST}/${FRAMEWORK}"
+# ditto preserves the versioned framework symlinks.
+/usr/bin/ditto "${CEF}/${FRAMEWORK}" "${DEST}/${FRAMEWORK}"
+while IFS= read -r -d '' library; do
+  /usr/bin/codesign "${SIGN_FLAGS[@]}" "${library}"
+done < <(find "${DEST}/${FRAMEWORK}/Versions/A/Libraries" -type f -name '*.dylib' -print0)
+/usr/bin/codesign "${SIGN_FLAGS[@]}" "${DEST}/${FRAMEWORK}"
+
 
 # The helpers are nested executables the notary service checks on their own, and
 # they are not Xcode targets, so the host app's ENABLE_HARDENED_RUNTIME never
