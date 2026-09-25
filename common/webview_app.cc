@@ -115,8 +115,16 @@ void WebviewApp::OnBeforeCommandLineProcessing(const CefString &process_type, Ce
 
 		command_line->AppendSwitch("disable-web-security");                                     //disable web security
 		command_line->AppendSwitch("allow-running-insecure-content");                           //allow running insecure content in secure pages
-		// Don't create a "GPUCache" directory when cache-path is unspecified.
-		command_line->AppendSwitch("disable-gpu-shader-disk-cache");                            //disable gpu shader disk cache
+		// The GPU shader disk cache amortizes shader compilation across launches
+		// (WebGL-heavy pages recompile every program on a cold GPU process —
+		// hundreds of ms of first-frames jank). Keep it enabled whenever a
+		// persistent cache path is configured; only disable it when running
+		// cache-less so Chromium doesn't create a stray "GPUCache" directory
+		// next to the executable.
+		if (!m_bHasPersistentCache)
+		{
+			command_line->AppendSwitch("disable-gpu-shader-disk-cache");                        //disable gpu shader disk cache
+		}
         command_line->AppendSwitch("no-sandbox");
 
 		//http://www.chromium.org/developers/design-documents/process-models
@@ -285,6 +293,11 @@ void WebviewApp::SetProcessMode(uint32_t uMode)
 void WebviewApp::SetEnableGPU(bool bEnable)
 {
     m_bEnableGPU = bEnable;
+}
+
+void WebviewApp::SetHasPersistentCache(bool bHasCache)
+{
+    m_bHasPersistentCache = bHasCache;
 }
 
 void WebviewApp::OnBeforeChildProcessLaunch(CefRefPtr<CefCommandLine> command_line)

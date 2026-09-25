@@ -48,6 +48,15 @@ namespace webview_cef {
         UINT tex_height_ = 0;
         DXGI_FORMAT tex_format_ = DXGI_FORMAT_B8G8R8A8_UNORM;
         FlutterDesktopPixelFormat flutter_format_ = kFlutterDesktopPixelFormatBGRA8888;
+        // Long-lived descriptor returned to Flutter. The engine reads it after
+        // its release_callback has already run (PopulateTexture reads
+        // visible_width/height after CreateOrUpdateTexture), so it must NOT be
+        // freed per call — a heap-allocated holder freed by release_callback is
+        // a use-after-free (debug-heap poisoning breaks Skia's texture wrap).
+        FlutterDesktopGpuSurfaceDescriptor descriptor_ = {};
+        // Pins the texture the descriptor's handle refers to across a bridge
+        // resize until the next ObtainDescriptor call.
+        Microsoft::WRL::ComPtr<ID3D11Texture2D> descriptor_tex_;
         std::mutex mutex_;
     };
 }

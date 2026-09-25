@@ -26,6 +26,27 @@ DEST="${TARGET_BUILD_DIR}/${FRAMEWORKS_FOLDER_PATH}"
 IDENTITY="${EXPANDED_CODE_SIGN_IDENTITY:--}"
 mkdir -p "${DEST}"
 
+# The helpers are nested executables the notary service checks on their own, and
+# they are not Xcode targets, so the host app's ENABLE_HARDENED_RUNTIME never
+# reaches them: the hardened runtime flag must be set right here, on every
+# signature, or notarization rejects every one of them. "Every signature"
+# includes ad-hoc ("-"): an archive built with CODE_SIGN_IDENTITY="-" signs the
+# helpers ad-hoc, and `xcodebuild -exportArchive` re-signs nested bundles for
+# Developer ID *preserving* the existing signature's flags and entitlements —
+# it never adds the runtime flag itself, so a flag missing here is missing in
+# the notarized artifact. An ad-hoc signature carries the flag fine; only a
+# secure timestamp is impossible without a real identity (and the export
+# re-sign supplies one anyway).
+SIGN_FLAGS=(--force --sign "${IDENTITY}" --options runtime)
+if [ "${IDENTITY}" = "-" ]; then
+  SIGN_FLAGS+=(--timestamp=none)
+else
+  SIGN_FLAGS+=(--timestamp)
+fi
+if [ -f "${ENT}" ]; then
+  SIGN_FLAGS+=(--entitlements "${ENT}")
+fi
+
 # "<name suffix>:<bundle-id suffix>" — see CEF_HELPER_APP_SUFFIXES.
 for spec in ":" " (GPU):.gpu" " (Plugin):.plugin" " (Renderer):.renderer" " (Alerts):.alerts"; do
   suffix="${spec%%:*}"
@@ -58,10 +79,6 @@ for spec in ":" " (GPU):.gpu" " (Plugin):.plugin" " (Renderer):.renderer" " (Ale
 </plist>
 PLIST
 
-  if [ -f "${ENT}" ]; then
-    /usr/bin/codesign --force --sign "${IDENTITY}" --entitlements "${ENT}" --timestamp=none "${app}"
-  else
-    /usr/bin/codesign --force --sign "${IDENTITY}" --timestamp=none "${app}"
-  fi
+  /usr/bin/codesign "${SIGN_FLAGS[@]}" "${app}"
   echo "embedded ${name}.app"
 done
