@@ -399,6 +399,11 @@ namespace webview_cef {
 			initCallback();
 			result(1, nullptr);
 		}
+		else if (name.compare("setMaxFrameRate") == 0) {
+			const int fps = values != nullptr ? int(webview_value_get_int(values)) : 0;
+			m_maxFrameRate.store(fps > 0 ? fps : 0, std::memory_order_relaxed);
+			result(1, nullptr);
+		}
 		else if (name.compare("quit") == 0) {
 			//only call this method when you want to quit the app
 			stopCEF();
@@ -801,9 +806,29 @@ namespace webview_cef {
 	}
 
 	void WebviewPlugin::tickBeginFrame(){
-		if (m_handler) {
-			m_handler->sendExternalBeginFrame();
+		if (!m_handler) {
+			return;
 		}
+		// Cap frame production: the platform ticks on every display refresh
+		// (120 Hz on ProMotion), and every produced frame is a full page render
+		// — for a WebGL map that is ~7-9 ms of renderer main thread. A
+		// quarter-interval slack absorbs tick jitter, so a 60 fps cap takes
+		// exactly every 2nd tick at 120 Hz, alternates 2/3 at 144 Hz, and every
+		// tick at 60 Hz.
+		const int fps = m_maxFrameRate.load(std::memory_order_relaxed);
+		if (fps > 0) {
+			const auto now = std::chrono::steady_clock::now();
+			const auto interval = std::chrono::nanoseconds(1000000000LL / fps);
+			if (now < m_nextBeginFrame - interval / 4) {
+				return;
+			}
+			// After an idle stretch or a stall, restart the schedule from now
+			// instead of bursting to catch up.
+			m_nextBeginFrame = now - m_nextBeginFrame > interval
+				? now + interval
+				: m_nextBeginFrame + interval;
+		}
+		m_handler->sendExternalBeginFrame();
 	}
 	
 	int WebviewPlugin::cursorAction(WValue *args, std::string name) {

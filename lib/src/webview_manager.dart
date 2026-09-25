@@ -75,6 +75,15 @@ class WebviewManager extends ValueNotifier<bool> {
     return _creatingCompleter.future;
   }
 
+  /// Caps how often the off-screen browsers produce frames, in frames per
+  /// second. Frames are driven by the display's refresh (e.g. 120 Hz on a
+  /// ProMotion panel); every produced frame re-renders the page, so a cap
+  /// halves the render cost of a continuously animating page on a 120 Hz
+  /// display. Defaults to 60; pass 0 for one frame per display refresh.
+  /// Static pages are unaffected — they produce no frames either way.
+  Future<void> setMaxFrameRate(int fps) =>
+      pluginChannel.invokeMethod('setMaxFrameRate', fps);
+
   @override
   Future<void> dispose() async {
     super.dispose();

@@ -5,6 +5,8 @@
 #include "webview_app.h"
 #include <include/cef_base.h>
 
+#include <atomic>
+#include <chrono>
 #include <functional>
 namespace webview_cef {
     class WebviewTexture{
@@ -33,7 +35,8 @@ namespace webview_cef {
         void setInvokeMethodFunc(std::function<void(std::string, WValue*)> func);
         void setCreateTextureFunc(std::function<std::shared_ptr<WebviewTexture>()> func);
         bool getAnyBrowserFocused();
-        // Drive one external BeginFrame for this plugin's browsers (GPU path).
+        // Drive one external BeginFrame for this plugin's browsers (GPU path),
+        // unless the frame-rate cap says this display refresh is skipped.
         void tickBeginFrame();
         // IME state of the currently focused browser (see WebviewTexture). The
         // macOS key router uses these to send text/composition keys to the OS
@@ -59,6 +62,11 @@ namespace webview_cef {
 	    CefRefPtr<WebviewApp> m_app;
     	std::unordered_map<int, std::shared_ptr<WebviewTexture>> m_renderers;
 	    bool m_init = false;
+        // Frame-rate cap for tickBeginFrame (frames per second, 0 = one frame
+        // per display refresh). Set from the platform thread, read on the
+        // begin-frame thread.
+        std::atomic<int> m_maxFrameRate{60};
+        std::chrono::steady_clock::time_point m_nextBeginFrame{};
     };
 
     int initCEFProcesses(CefMainArgs args);

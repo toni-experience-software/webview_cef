@@ -442,9 +442,9 @@ private:
             }
             return event;
         }];
-        // Drive frame production on the display's vblank so the webview renders
-        // at the monitor's refresh rate (e.g. 120 Hz ProMotion) and idles when
-        // static, instead of CEF's 60 fps windowless cap. If the display link
+        // Drive frame production on the display's vblank so frames are paced
+        // by the monitor and idle when static. WebviewPlugin::tickBeginFrame
+        // caps the rate (60 fps by default, see setMaxFrameRate). If the display link
         // can't start (e.g. headless), the pump timer's fallback above keeps
         // requesting frames.
         if (CVDisplayLinkCreateWithActiveCGDisplays(&_displayLink) == kCVReturnSuccess && _displayLink) {
