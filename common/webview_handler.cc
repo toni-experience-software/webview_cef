@@ -418,9 +418,15 @@ void WebviewHandler::changeSize(int browserId, float a_dpi, int w, int h)
 {
     auto it = browser_map_.find(browserId);
     if (it != browser_map_.end()) {
+        const bool dpiChanged = it->second.dpi != a_dpi;
         it->second.dpi = a_dpi;
         it->second.width = w;
         it->second.height = h;
+        // A new scale factor reaches CEF through GetScreenInfo, which it only
+        // re-reads when told the screen changed.
+        if (dpiChanged) {
+            it->second.browser->GetHost()->NotifyScreenInfoChanged();
+        }
         it->second.browser->GetHost()->WasResized();
     }
 }

@@ -435,6 +435,11 @@ class WebViewState extends State<WebView> with WebeViewTextInput {
   bool isPrimaryFocus = false;
   WebviewTooltip? _tooltip;
   MouseCursor _mouseType = SystemMouseCursors.basic;
+
+  /// The pixel ratio last reported to the browser; a change is re-reported
+  /// even when the size stays the same.
+  double? _reportedDpr;
+
   bool? _hasNativeKeySupport;
 
   WebViewController get _controller => widget.controller;
@@ -613,6 +618,15 @@ class WebViewState extends State<WebView> with WebeViewTextInput {
     // Report initial surface size
     WidgetsBinding.instance
         .addPostFrameCallback((_) => _reportSurfaceSize(context));
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final dpr = MediaQuery.devicePixelRatioOf(context);
+    if (_reportedDpr != null && dpr != _reportedDpr) {
+      _reportSurfaceSize(context);
+    }
   }
 
   KeyEventResult _onKeyEvent(FocusNode node, KeyEvent event) {
@@ -860,6 +874,7 @@ class WebViewState extends State<WebView> with WebeViewTextInput {
     double dpi = MediaQuery.of(context).devicePixelRatio;
     final box = _key.currentContext?.findRenderObject() as RenderBox?;
     if (box != null) {
+      _reportedDpr = dpi;
       await _controller.ready;
       unawaited(
           _controller._setSize(dpi, Size(box.size.width, box.size.height)));
