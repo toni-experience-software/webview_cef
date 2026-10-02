@@ -265,7 +265,9 @@ void WebviewHandler::OnLoadError(CefRefPtr<CefBrowser> browser,
 
 void WebviewHandler::OnLoadStart(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame,
                                  CefLoadHandler::TransitionType transition_type) {
-    if(onLoadStart){
+    // Subframe loads don't replace the page; reporting them made embedders
+    // treat a live page as reloaded.
+    if(onLoadStart && frame->IsMain()){
         onLoadStart(browser->GetIdentifier(), frame->GetURL());
     }
     return;
@@ -273,7 +275,7 @@ void WebviewHandler::OnLoadStart(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFra
 
 void WebviewHandler::OnLoadEnd(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame,
                                int httpStatusCode) {
-    if(onLoadEnd){
+    if(onLoadEnd && frame->IsMain()){
         onLoadEnd(browser->GetIdentifier(), frame->GetURL());
     }
     return;
