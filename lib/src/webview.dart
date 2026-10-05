@@ -4,6 +4,7 @@ import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import 'promoted_mouse_filter.dart';
 import 'webview_manager.dart';
 import 'webview_events_listener.dart';
 import 'webview_javascript.dart';
@@ -465,9 +466,29 @@ class WebViewState extends State<WebView> with WebeViewTextInput {
   double _touchPressure(PointerEvent ev) =>
       ev.pressure > 0 ? ev.pressure.clamp(0.0, 1.0).toDouble() : 1.0;
 
-  // Which CEF button each active mouse pointer pressed. A `PointerUpEvent`
+  // The CEF press each active non-touch pointer holds. A `PointerUpEvent`
   // reports `buttons == 0`, so the release must be told what it ends.
-  final Map<int, int> _pressedButtons = <int, int>{};
+  final Map<int, _HeldPress> _pressedButtons = <int, _HeldPress>{};
+
+  // Drops the mouse events Windows synthesizes for a touch, so none of them
+  // reaches CEF as a press that is never released.
+  final PromotedMouseFilter _promotedMouse = PromotedMouseFilter();
+
+  bool _isPromotedMouse(PointerEvent ev) => _promotedMouse.isPromoted(
+      ev.kind, ev.timeStamp,
+      touchActive: _touchSlots.isNotEmpty);
+
+  // Releases every mouse press still held in CEF, where it was last seen. A
+  // held button turns each following touch drag into a fight with it. Pen
+  // presses are left alone: a palm touching down mid-stroke must not end it.
+  void _releaseHeldMouseButtons() {
+    _pressedButtons.removeWhere((_, press) {
+      if (press.kind != PointerDeviceKind.mouse) return false;
+      _controller._cursorClickUp(
+          press.position, _keyboardModifiers(), press.button, _clickCount);
+      return true;
+    });
+  }
 
   // Consecutive-click tracking. Chromium does NOT derive click counts for
   // windowless browsers — whatever the embedder passes to SendMouseClickEvent
@@ -770,6 +791,7 @@ class WebViewState extends State<WebView> with WebeViewTextInput {
       child: SizeChangedLayoutNotifier(
         child: Listener(
           onPointerHover: (ev) {
+            if (_isPromotedMouse(ev)) return;
             _controller._cursorMove(ev.localPosition,
                 _keyboardModifiers() | _buttonModifiers(ev.buttons));
             _tooltip?.cursorOffset = ev.position;
@@ -787,11 +809,15 @@ class WebViewState extends State<WebView> with WebeViewTextInput {
               });
             }
             if (ev.kind == PointerDeviceKind.touch) {
+              _promotedMouse.noteTouch(ev.timeStamp);
+              _releaseHeldMouseButtons();
               _controller._sendTouchEvent(_acquireTouchSlot(ev.pointer), 0,
                   ev.localPosition, _touchPressure(ev));
             } else {
+              if (_isPromotedMouse(ev)) return;
               final button = _mouseButtonOf(ev.buttons);
-              _pressedButtons[ev.pointer] = button;
+              _pressedButtons[ev.pointer] =
+                  _HeldPress(button, ev.kind, ev.localPosition);
               _controller._cursorClickDown(
                   ev.localPosition,
                   _keyboardModifiers() | _buttonModifiers(ev.buttons),
@@ -801,6 +827,7 @@ class WebViewState extends State<WebView> with WebeViewTextInput {
           },
           onPointerUp: (ev) {
             if (ev.kind == PointerDeviceKind.touch) {
+              _promotedMouse.noteTouch(ev.timeStamp);
               final slot = _touchSlots.remove(ev.pointer);
               if (slot != null) {
                 _controller._sendTouchEvent(
@@ -809,18 +836,19 @@ class WebViewState extends State<WebView> with WebeViewTextInput {
             } else {
               // `ev.buttons` is already 0 on release, so the button comes from
               // the matching press; the click count must match the press too or
-              // Blink won't pair them into a click.
-              final button =
-                  _pressedButtons.remove(ev.pointer) ?? mouseButtonLeft;
-              _controller._cursorClickUp(
-                  ev.localPosition, _keyboardModifiers(), button, _clickCount);
+              // Blink won't pair them into a click. No recorded press means it
+              // was dropped as promoted or already released.
+              final press = _pressedButtons.remove(ev.pointer);
+              if (press == null) return;
+              _controller._cursorClickUp(ev.localPosition,
+                  _keyboardModifiers(), press.button, _clickCount);
             }
           },
           onPointerCancel: (ev) {
             // Without the CANCELLED event a stuck contact wedges Chromium's
-            // gesture recognizer. Non-touch cancels have no mouse-path
-            // equivalent (CEF can't cancel a press), so they only release the
-            // button bookkeeping.
+            // gesture recognizer. CEF can't cancel a mouse press, so a
+            // cancelled mouse pointer is released instead; left held, it
+            // fights every later touch drag.
             if (ev.kind == PointerDeviceKind.touch) {
               final slot = _touchSlots.remove(ev.pointer);
               if (slot != null) {
@@ -828,17 +856,32 @@ class WebViewState extends State<WebView> with WebeViewTextInput {
                     slot, 3, ev.localPosition, _touchPressure(ev));
               }
             } else {
-              _pressedButtons.remove(ev.pointer);
+              final press = _pressedButtons.remove(ev.pointer);
+              if (press != null) {
+                _controller._cursorClickUp(ev.localPosition,
+                    _keyboardModifiers(), press.button, _clickCount);
+              }
             }
           },
           onPointerMove: (ev) {
             if (ev.kind == PointerDeviceKind.touch) {
+              _promotedMouse.noteTouch(ev.timeStamp);
               final slot = _touchSlots[ev.pointer];
               if (slot != null) {
                 _controller._sendTouchEvent(
                     slot, 1, ev.localPosition, _touchPressure(ev));
               }
             } else {
+              if (_isPromotedMouse(ev)) return;
+              final press = _pressedButtons[ev.pointer];
+              if (press == null) {
+                // Buttons down without a press CEF knows of (it was dropped
+                // or force-released): a plain move, so the page never sees
+                // a drag it got no pointerdown for.
+                _controller._cursorMove(ev.localPosition, _keyboardModifiers());
+                return;
+              }
+              press.position = ev.localPosition;
               _controller._cursorDragging(ev.localPosition,
                   _keyboardModifiers() | _buttonModifiers(ev.buttons));
             }
@@ -880,4 +923,16 @@ class WebViewState extends State<WebView> with WebeViewTextInput {
           _controller._setSize(dpi, Size(box.size.width, box.size.height)));
     }
   }
+}
+
+/// A press forwarded to CEF for one non-touch pointer.
+class _HeldPress {
+  _HeldPress(this.button, this.kind, this.position);
+
+  /// The `cef_mouse_button_type_t` pressed.
+  final int button;
+  final PointerDeviceKind kind;
+
+  /// Where the pointer was last forwarded.
+  Offset position;
 }

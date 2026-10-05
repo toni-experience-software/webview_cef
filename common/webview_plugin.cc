@@ -862,9 +862,6 @@ namespace webview_cef {
 		int browserId = at(0, 0);
 		int x = at(1, 0);
 		int y = at(2, 0);
-		if (!x && !y) {
-			return 0;
-		}
 		uint32_t modifiers = (uint32_t)at(3, 0);
 		if (name.compare("cursorClickDown") == 0) {
 			m_handler->cursorClick(browserId, x, y, false, at(4, 0), at(5, 1), modifiers);
